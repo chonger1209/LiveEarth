@@ -1,0 +1,39 @@
+[package]
+name = "earthlive-v2"
+version = "0.4.6"
+edition = "2024"
+default-run = "LiveEarth"
+license = "MIT"
+description = "Himawari satellite image archiving and Windows wallpaper"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive"] }
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "bmp", "webp"] }
+image-webp = "0.2.4"
+raw-window-handle = "0.6.2"
+png = "0.18.1"
+reqwest = { version = "0.12.28", default-features = false, features = ["native-tls", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_Graphics_Gdi", "Win32_Security"] }
+
+[build-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "thin"
+
+[[bin]]
+name = "LiveEarth"
+path = "src/main.rs"
