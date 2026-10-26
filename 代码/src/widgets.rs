@@ -7,9 +7,9 @@ pub const WAITING: Color32 = Color32::from_rgb(90, 149, 123);
 pub const WORKING: Color32 = Color32::from_rgb(90, 160, 180);
 pub const RETRYING: Color32 = Color32::from_rgb(173, 149, 85);
 pub const STOPPED: Color32 = Color32::from_rgb(65, 78, 84);
+const SELECTED: Color32 = Color32::from_rgb(40, 73, 94);
 pub const SECONDARY: Color32 = Color32::from_rgb(145, 153, 161);
 pub const CONTROLS_WIDTH: f32 = 340.;
-pub const CONTROLS_HEIGHT: [f32; 3] = [465., 515., 585.];
 pub const LOG_MIN_HEIGHT: f32 = 145.;
 pub const MIN_WINDOW: [f32; 2] = [1000., 800.];
 pub const DEFAULT_WINDOW: [f32; 2] = [1180., 960.];
@@ -42,10 +42,7 @@ fn palette(widgets: &mut egui::style::Widgets, tone: Tone) {
             Color32::from_rgb(38, 46, 55),
             Color32::from_rgb(94, 109, 121),
         ),
-        Tone::Selected => (
-            Color32::from_rgb(40, 73, 94),
-            Color32::from_rgb(100, 150, 180),
-        ),
+        Tone::Selected => (SELECTED, Color32::from_rgb(100, 150, 180)),
         Tone::Running => (
             Color32::from_rgb(35, 76, 65),
             Color32::from_rgb(90, 149, 123),
@@ -72,7 +69,7 @@ fn palette(widgets: &mut egui::style::Widgets, tone: Tone) {
 pub fn style(ctx: &egui::Context) {
     ctx.style_mut(|s| {
         palette(&mut s.visuals.widgets, Tone::Neutral);
-        s.visuals.selection.bg_fill = Color32::from_rgb(40, 73, 94);
+        s.visuals.selection.bg_fill = SELECTED;
     });
 }
 

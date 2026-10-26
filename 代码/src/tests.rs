@@ -869,7 +869,7 @@ fn retention_keeps_newest_and_unrelated_files_and_honors_cancel() {
     std::fs::remove_file(&paths[1]).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let files = crate::archive_index::files(dir.path()).unwrap();
+        let files = crate::archive_index::files(dir.path(), &stop).unwrap();
         if !files.contains(&paths[1]) {
             break;
         }
@@ -877,7 +877,81 @@ fn retention_keeps_newest_and_unrelated_files_and_honors_cancel() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        crate::archive_index::files(dir.path()).unwrap(),
+        crate::archive_index::files(dir.path(), &stop).unwrap(),
         vec![paths[2].clone()]
+    );
+}
+
+#[test]
+fn guide_preferences_preserve_new_old_and_dismissed_choices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut preferences = Preferences::new(dir.path());
+    assert!(preferences.show_guide_on_start);
+    settings::save(dir.path(), &preferences).unwrap();
+    assert!(settings::load(dir.path()).0.show_guide_on_start);
+    preferences.show_guide_on_start = false;
+    settings::save(dir.path(), &preferences).unwrap();
+    assert!(!settings::load(dir.path()).0.show_guide_on_start);
+    let mut old = serde_json::to_value(&preferences).unwrap();
+    old.as_object_mut().unwrap().remove("show_guide_on_start");
+    std::fs::write(
+        dir.path().join("settings.json"),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    let (loaded, warning) = settings::load(dir.path());
+    assert!(warning.is_none());
+    assert!(
+        !loaded.show_guide_on_start,
+        "an existing user must not get a forced guide"
+    );
+    assert_eq!(loaded.grid, preferences.grid);
+    assert_eq!(loaded.photos, preferences.photos);
+}
+
+#[tokio::test]
+async fn redirects_follow_same_origin_and_reject_cross_origin_or_loops() {
+    let sink = server(|_| Reply::ok(b"should not be requested".to_vec())).await;
+    let other = format!("{}/blocked", sink.origin);
+    let source = server(move |path| match path {
+        "/start" => Reply {
+            status: 302,
+            headers: "Location: /finish\r\n".into(),
+            bytes: vec![],
+            delay: Duration::ZERO,
+        },
+        "/finish" => Reply::ok(b"ok".to_vec()),
+        "/cross" => Reply {
+            status: 302,
+            headers: format!("Location: {other}\r\n"),
+            bytes: vec![],
+            delay: Duration::ZERO,
+        },
+        _ => Reply {
+            status: 302,
+            headers: "Location: /loop\r\n".into(),
+            bytes: vec![],
+            delay: Duration::ZERO,
+        },
+    })
+    .await;
+    let client = Source::local(&source.origin).unwrap();
+    let stop = Stop::default();
+    assert_eq!(client.get("/start", 32, &stop).await.unwrap(), b"ok");
+    for path in ["/cross", "/loop"] {
+        let error = client.get(path, 32, &stop).await.unwrap_err();
+        assert_eq!(
+            crate::service::classify(&error),
+            crate::service::Fault::Transient
+        );
+    }
+    assert!(
+        sink.hits.lock().unwrap().is_empty(),
+        "a refused redirect must send no cross-origin request"
+    );
+    let error = anyhow::Error::new(crate::net::HttpFailure(302));
+    assert_eq!(
+        crate::service::classify(&error),
+        crate::service::Fault::Transient
     );
 }

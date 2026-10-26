@@ -96,11 +96,11 @@ pub fn load(path: &Path, stop: &Stop) -> Result<Frame> {
     Ok(frame)
 }
 
-fn candidates(directory: &Path, observation: &Observation) -> Result<Vec<PathBuf>> {
+fn candidates(directory: &Path, observation: &Observation, stop: &Stop) -> Result<Vec<PathBuf>> {
     let prefix = format!("{}_", observation.time.format("%Y%m%dT%H%M%SZ"));
     let size = format!("_{}_{}x{}", PRODUCT, observation.side(), observation.side());
     let mut paths = Vec::new();
-    for path in crate::archive_index::files(directory)? {
+    for path in crate::archive_index::files(directory, stop)? {
         let name = path.file_name().unwrap().to_string_lossy();
         if name.starts_with(&prefix) && name.contains(&size) {
             paths.push(path);
@@ -115,7 +115,7 @@ pub fn existing(
     observation: &Observation,
     stop: &Stop,
 ) -> Result<Option<PathBuf>> {
-    for path in candidates(directory, observation)? {
+    for path in candidates(directory, observation, stop)? {
         stop.check()?;
         if let Ok(frame) = load(&path, stop)
             && frame.observation.time == observation.time
@@ -139,7 +139,7 @@ pub fn save_as(
 ) -> Result<Saved> {
     fs::create_dir_all(directory)?;
     let digest = frame.fingerprint(stop)?;
-    for path in candidates(directory, &frame.observation)? {
+    for path in candidates(directory, &frame.observation, stop)? {
         stop.check()?;
         if let Ok(old) = load(&path, stop)
             && old.observation.time == frame.observation.time
@@ -286,7 +286,7 @@ pub fn trim(
         return Ok(());
     }
     let _lease = lock(directory)?;
-    let files = crate::archive_index::files(directory)?;
+    let files = crate::archive_index::files(directory, stop)?;
     let mut count = files.len();
     for path in files {
         if count <= limit as usize {

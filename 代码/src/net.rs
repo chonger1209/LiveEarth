@@ -32,6 +32,7 @@ impl Source {
         Self::at(ORIGIN)
     }
     fn at(origin: &str) -> Result<Self> {
+        let root = reqwest::Url::parse(origin)?;
         Ok(Self {
             client: Client::builder()
                 .user_agent(concat!(
@@ -41,7 +42,15 @@ impl Source {
                 ))
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                    if attempt.previous().len() > 3 {
+                        attempt.error("源站跳转次数超过 3 次，稍后重试")
+                    } else if same_origin_redirect(&root, attempt.url()) {
+                        attempt.follow()
+                    } else {
+                        attempt.error("源站跳转到不受支持的地址，已拒绝跨域或协议变更")
+                    }
+                }))
                 .build()?,
             origin: origin.trim_end_matches('/').into(),
             cooldown: Arc::new(Mutex::new(Instant::now())),
@@ -126,6 +135,13 @@ impl Source {
         tokio::select! { _ = stop.cancelled() => bail!("已取消"), _ = tokio::time::sleep(time) => Ok(()) }
     }
 }
+fn same_origin_redirect(origin: &reqwest::Url, next: &reqwest::Url) -> bool {
+    origin.scheme() == next.scheme()
+        && origin.host_str() == next.host_str()
+        && origin.port_or_known_default() == next.port_or_known_default()
+        && next.username().is_empty()
+        && next.password().is_none()
+}
 struct DateHeader;
 impl DateHeader {
     fn seconds(value: &str) -> Option<u64> {
@@ -134,5 +150,27 @@ impl DateHeader {
                 .num_seconds()
                 .max(0) as u64
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn redirect_policy_preserves_https_origin_and_port() {
+        let root = reqwest::Url::parse("https://example.com/source").unwrap();
+        for (url, allowed) in [
+            ("https://example.com/next", true),
+            ("https://example.com:443/next", true),
+            ("http://example.com/next", false),
+            ("https://other.example.com/next", false),
+            ("https://example.com:444/next", false),
+            ("https://user:password@example.com/next", false),
+        ] {
+            assert_eq!(
+                same_origin_redirect(&root, &reqwest::Url::parse(url).unwrap()),
+                allowed
+            );
+        }
     }
 }

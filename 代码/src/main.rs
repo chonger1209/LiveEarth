@@ -21,7 +21,9 @@ use std::{
 };
 
 mod gui;
+mod guide;
 mod widgets;
+use gui::CaptureMode;
 use widgets::{Tone, button};
 
 #[derive(Parser)]
@@ -43,13 +45,15 @@ struct App {
     _instance: File,
     prefs: Preferences,
     photos: String,
-    mode: u8,
+    mode: CaptureMode,
     from: String,
     until: String,
     step: u32,
     refresh: bool,
     settings_open: bool,
     about_open: bool,
+    guide_open: bool,
+    guide_no_repeat: bool,
     dirty: bool,
     pending: Option<std::sync::mpsc::Receiver<ConfigReply>>,
     picker: Option<std::sync::mpsc::Receiver<Result<Option<PathBuf>>>>,
@@ -94,7 +98,6 @@ impl App {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = egui::Color32::from_rgb(20, 25, 31);
         visuals.window_fill = egui::Color32::from_rgb(24, 30, 37);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(42, 88, 114);
         ctx.set_visuals(visuals);
         ctx.style_mut(|s| {
             s.spacing.item_spacing = egui::vec2(9., 5.);
@@ -149,14 +152,16 @@ impl App {
         }
         let startup_minimized =
             options.startup && prefs.start_minimized && options.smoke_screenshot.is_none();
+        let guide_open = prefs.show_guide_on_start && options.smoke_screenshot.is_none();
+        let guide_no_repeat = !prefs.show_guide_on_start;
         Self {
             _instance: instance,
             photos: prefs.photos.to_string_lossy().into(),
             prefs,
             mode: if options.smoke_view == "history" {
-                2
+                CaptureMode::History
             } else {
-                0
+                CaptureMode::Latest
             },
             from: time.clone(),
             until: time,
@@ -164,6 +169,8 @@ impl App {
             refresh: false,
             settings_open: options.smoke_view == "settings",
             about_open: options.smoke_view == "about",
+            guide_open,
+            guide_no_repeat,
             dirty: false,
             pending: None,
             picker: None,
@@ -260,14 +267,14 @@ impl App {
     }
     fn selection(&self) -> Result<Selection> {
         match self.mode {
-            0 => Ok(Selection::Latest(self.prefs.grid)),
-            1 => {
+            CaptureMode::Latest => Ok(Selection::Latest(self.prefs.grid)),
+            CaptureMode::AtTime => {
                 let o =
                     Observation::new(parse_time(&self.from, self.prefs.beijing)?, self.prefs.grid)?;
                 ensure!(o.time <= Utc::now(), "不能抓取未来时间");
                 Ok(Selection::History(vec![o]))
             }
-            _ => Ok(Selection::History(range(
+            CaptureMode::History => Ok(Selection::History(range(
                 parse_time(&self.from, self.prefs.beijing)?,
                 parse_time(&self.until, self.prefs.beijing)?,
                 self.step,
@@ -336,7 +343,7 @@ impl eframe::App for App {
                 });
             });
         });
-        let controls_height = widgets::CONTROLS_HEIGHT[self.mode as usize];
+        let controls_height = self.mode.controls_height();
         let max_log =
             (ctx.available_rect().height() - controls_height).max(widgets::LOG_MIN_HEIGHT);
         egui::TopBottomPanel::bottom("status")
@@ -395,6 +402,7 @@ impl eframe::App for App {
         });
         self.settings_window(ctx);
         self.about_window(ctx);
+        self.guide_window(ctx);
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) && !ctx.wants_keyboard_input() {
             self.submit_settings(None);
         }

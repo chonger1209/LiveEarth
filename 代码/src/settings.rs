@@ -10,6 +10,8 @@ use std::{
 pub struct Preferences {
     pub schema: u8,
     #[serde(default)]
+    pub show_guide_on_start: bool,
+    #[serde(default)]
     pub photo_limit: u32,
     pub grid: u32,
     pub zoom: u16,
@@ -44,6 +46,7 @@ impl Preferences {
     pub fn new(data: &Path) -> Self {
         Self {
             schema: 4,
+            show_guide_on_start: true,
             photo_limit: 99,
             grid: 4,
             zoom: 100,

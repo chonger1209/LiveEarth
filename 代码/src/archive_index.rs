@@ -1,5 +1,6 @@
 //! One in-memory directory inventory, updated from Windows filename notifications.
 //! Image decoding remains in reuse checks; indexing and deletion read metadata only.
+use crate::domain::Stop;
 use anyhow::Result;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::{
@@ -144,6 +145,11 @@ struct Index {
     directory: PathBuf,
     watch: Option<Watch>,
     files: BTreeSet<PathBuf>,
+    initialized: bool,
+    degraded: bool,
+    mode_change: Option<bool>,
+    #[cfg(test)]
+    scans: usize,
 }
 static INDEX: OnceLock<Mutex<Index>> = OnceLock::new();
 fn archive_name(path: &Path) -> bool {
@@ -159,9 +165,15 @@ fn archive_name(path: &Path) -> bool {
             .is_some_and(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ").is_ok())
 }
 impl Index {
-    fn scan(&mut self) -> Result<()> {
+    fn scan(&mut self, stop: &Stop) -> Result<()> {
+        stop.check()?;
+        #[cfg(test)]
+        {
+            self.scans += 1;
+        }
         let mut files = BTreeSet::new();
         for entry in fs::read_dir(&self.directory)? {
+            stop.check()?;
             let entry = entry?;
             if archive_name(&entry.path())
                 && entry.file_type()?.is_file()
@@ -170,18 +182,52 @@ impl Index {
                 files.insert(entry.path());
             }
         }
+        stop.check()?;
         self.files = files;
         Ok(())
     }
-    fn sync(&mut self, directory: &Path) -> Result<()> {
-        if self.directory != directory || self.watch.is_none() {
-            self.directory = directory.to_owned();
-            self.watch = Some(Watch::new(directory)?);
-            return self.scan();
+    fn rebuild(&mut self, directory: &Path, stop: &Stop, watch: Result<Watch>) -> Result<()> {
+        self.initialized = false;
+        self.directory = directory.to_owned();
+        self.watch = watch.ok();
+        self.scan(stop)?;
+        let degraded = self.watch.is_none();
+        if degraded != self.degraded {
+            self.mode_change = Some(degraded);
         }
-        match self.watch.as_mut().unwrap().changes() {
+        self.degraded = degraded;
+        self.initialized = true;
+        Ok(())
+    }
+    fn begin_batch_with(
+        &mut self,
+        directory: &Path,
+        stop: &Stop,
+        make_watch: impl FnOnce(&Path) -> Result<Watch>,
+    ) -> Result<()> {
+        stop.check()?;
+        if self.directory != directory || !self.initialized || self.degraded {
+            // Reconnect only once at the next batch boundary, never per lookup.
+            self.watch = None;
+            self.rebuild(directory, stop, make_watch(directory))
+        } else {
+            self.sync(directory, stop)
+        }
+    }
+    fn sync(&mut self, directory: &Path, stop: &Stop) -> Result<()> {
+        stop.check()?;
+        if self.directory != directory || !self.initialized {
+            self.watch = None;
+            return self.rebuild(directory, stop, Watch::new(directory));
+        }
+        let Some(watch) = &mut self.watch else {
+            // Degraded mode reuses this batch's inventory. Our saves/deletes call record().
+            return Ok(());
+        };
+        match watch.changes() {
             Ok(Some(names)) => {
                 for name in names.into_iter().collect::<BTreeSet<_>>() {
+                    stop.check()?;
                     let path = directory.join(name);
                     if !archive_name(&path) {
                         continue;
@@ -195,23 +241,40 @@ impl Index {
                     }
                 }
             }
-            Ok(None) => self.scan()?,
+            Ok(None) => self.scan(stop)?,
             Err(_) => {
-                self.watch = Some(Watch::new(directory)?);
-                self.scan()?;
+                self.watch = None;
+                self.rebuild(directory, stop, Watch::new(directory))?;
             }
         }
         Ok(())
     }
+    fn invalidate(&mut self) {
+        self.initialized = false;
+        self.watch = None;
+    }
 }
-pub fn files(directory: &Path) -> Result<Vec<PathBuf>> {
-    let mut index = INDEX
+fn index() -> std::sync::MutexGuard<'static, Index> {
+    INDEX
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if let Err(error) = index.sync(directory) {
-        index.watch = None;
-        index.files.clear();
+        .unwrap_or_else(|p| p.into_inner())
+}
+pub fn begin_batch(directory: &Path, stop: &Stop) -> Result<Option<bool>> {
+    let mut index = index();
+    if let Err(error) = index.begin_batch_with(directory, stop, Watch::new) {
+        index.invalidate();
+        return Err(error);
+    }
+    Ok(index.mode_change.take())
+}
+pub fn take_mode_change() -> Option<bool> {
+    index().mode_change.take()
+}
+pub fn files(directory: &Path, stop: &Stop) -> Result<Vec<PathBuf>> {
+    let mut index = index();
+    if let Err(error) = index.sync(directory, stop) {
+        index.invalidate();
         return Err(error);
     }
     Ok(index.files.iter().cloned().collect())
@@ -227,5 +290,99 @@ pub fn record(path: &Path, exists: bool) {
         } else {
             index.files.remove(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        domain::Observation,
+        imaging::{Colors, Frame},
+        storage,
+    };
+    use chrono::{TimeZone, Utc};
+    use std::time::{Duration, Instant};
+
+    fn photo(directory: &Path) -> PathBuf {
+        let frame = Frame {
+            observation: Observation::new(Utc.with_ymd_and_hms(2026, 10, 22, 6, 0, 0).unwrap(), 1)
+                .unwrap(),
+            pixels: image::RgbImage::new(550, 550),
+            colors: Colors::default(),
+        };
+        storage::save(directory, &frame, &Stop::default())
+            .unwrap()
+            .path
+    }
+
+    #[test]
+    fn native_notifications_update_an_isolated_index_without_rescanning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = photo(dir.path());
+        let stop = Stop::default();
+        let mut index = Index::default();
+        index
+            .begin_batch_with(dir.path(), &stop, Watch::new)
+            .unwrap();
+        assert!(!index.degraded);
+        assert!(index.files.contains(&path));
+        fs::remove_file(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while index.files.contains(&path) {
+            index.sync(dir.path(), &stop).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "native deletion notification missing"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            index.scans, 1,
+            "a rescan must not masquerade as a notification"
+        );
+    }
+
+    #[test]
+    fn unavailable_notifications_scan_once_per_batch_then_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Stop::default();
+        let mut index = Index::default();
+        let unavailable = |_: &Path| Err(anyhow::anyhow!("notifications unsupported"));
+        index
+            .begin_batch_with(dir.path(), &stop, unavailable)
+            .unwrap();
+        assert_eq!(index.mode_change.take(), Some(true));
+        let path = photo(dir.path());
+        for _ in 0..3 {
+            index.sync(dir.path(), &stop).unwrap();
+        }
+        assert_eq!(index.scans, 1);
+        assert!(
+            index.files.is_empty(),
+            "external changes are reconciled at the next batch"
+        );
+        index
+            .begin_batch_with(dir.path(), &stop, unavailable)
+            .unwrap();
+        assert_eq!(index.scans, 2);
+        assert!(index.files.contains(&path));
+        assert_eq!(
+            index.mode_change.take(),
+            None,
+            "do not repeat the degradation log"
+        );
+        let cancelled = Stop::default();
+        cancelled.cancel();
+        assert!(index.scan(&cancelled).is_err());
+        assert!(
+            index.files.contains(&path),
+            "cancelled scan must not publish a partial inventory"
+        );
+        index
+            .begin_batch_with(dir.path(), &stop, Watch::new)
+            .unwrap();
+        assert_eq!(index.mode_change.take(), Some(false));
+        assert!(!index.degraded);
     }
 }

@@ -27,6 +27,7 @@ pub enum Notice {
     Missing(Observation),
     WallpaperUpdated,
     Pruned,
+    ArchiveMode { degraded: bool },
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
@@ -86,6 +87,9 @@ pub async fn run_as(
     notify: &(dyn Fn(Notice) + Sync),
 ) -> Result<Report> {
     let _lease = storage::lock(directory)?;
+    if let Some(degraded) = crate::archive_index::begin_batch(directory, stop)? {
+        notify(Notice::ArchiveMode { degraded });
+    }
     // Check destination before any download.
     tempfile::NamedTempFile::new_in(directory).context("照片目录不可写")?;
     let frames = match selection {
@@ -153,6 +157,9 @@ pub async fn run_as(
                 });
             }
         }
+    }
+    if let Some(degraded) = crate::archive_index::take_mode_change() {
+        notify(Notice::ArchiveMode { degraded });
     }
     stop.check()?;
     Ok(report)

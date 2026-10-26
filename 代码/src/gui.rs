@@ -1,4 +1,28 @@
 use super::*;
+use earthlive_v2::domain::TILE;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CaptureMode {
+    Latest,
+    AtTime,
+    History,
+}
+impl CaptureMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Latest => "最新",
+            Self::AtTime => "指定时刻",
+            Self::History => "历史区间",
+        }
+    }
+    pub(super) fn controls_height(self) -> f32 {
+        match self {
+            Self::Latest => 465.,
+            Self::AtTime => 515.,
+            Self::History => 585.,
+        }
+    }
+}
 
 impl App {
     pub(super) fn controls(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
@@ -7,10 +31,14 @@ impl App {
         ui.add_enabled_ui(editable, |ui| {
             ui.horizontal(|ui| {
                 let width = widgets::third_width(ui);
-                for (mode, label) in [(0, "最新"), (1, "指定时刻"), (2, "历史区间")] {
+                for mode in [
+                    CaptureMode::Latest,
+                    CaptureMode::AtTime,
+                    CaptureMode::History,
+                ] {
                     if button(
                         ui,
-                        label,
+                        mode.label(),
                         width,
                         if self.mode == mode {
                             Tone::Selected
@@ -24,13 +52,13 @@ impl App {
                     }
                 }
             });
-            if self.mode > 0 {
+            if self.mode != CaptureMode::Latest {
                 self.dirty |= ui
                     .checkbox(&mut self.prefs.beijing, "输入使用北京时间")
                     .on_hover_text("勾选为 UTC+8，未勾选为 UTC。")
                     .changed();
                 ui.horizontal(|ui| {
-                    ui.label(if self.mode == 1 {
+                    ui.label(if self.mode == CaptureMode::AtTime {
                         "观测时刻"
                     } else {
                         "开始时刻"
@@ -38,7 +66,7 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut self.from).desired_width(210.))
                         .on_hover_text("例如 2026-10-23 15:30，须落在 10 分钟边界。");
                 });
-                if self.mode == 2 {
+                if self.mode == CaptureMode::History {
                     ui.horizontal(|ui| {
                         ui.label("结束时刻");
                         ui.add(egui::TextEdit::singleline(&mut self.until).desired_width(210.))
@@ -61,8 +89,8 @@ impl App {
                 egui::ComboBox::from_id_salt("grid")
                     .selected_text(format!(
                         "{}×{}",
-                        self.prefs.grid * 550,
-                        self.prefs.grid * 550
+                        self.prefs.grid * TILE,
+                        self.prefs.grid * TILE
                     ))
                     .show_ui(ui, |ui| {
                         for n in [1, 2, 4, 8, 16] {
@@ -70,7 +98,7 @@ impl App {
                                 .selectable_value(
                                     &mut self.prefs.grid,
                                     n,
-                                    format!("{}×{}", n * 550, n * 550),
+                                    format!("{}×{}", n * TILE, n * TILE),
                                 )
                                 .changed();
                         }
@@ -119,17 +147,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.heading("定时抓取");
             widgets::activity(ui, s.activity());
-            let state = if s.exiting {
-                "正在退出"
-            } else if s.busy {
-                &s.status
-            } else if s.retrying && s.enabled {
-                "等待重试"
-            } else if s.enabled {
-                "定时抓取中"
-            } else {
-                "已停止"
-            };
+            let state = s.activity_text();
             ui.add(
                 egui::Label::new(egui::RichText::new(state).size(13.).color(if s.error {
                     widgets::ERROR
@@ -192,7 +210,7 @@ impl App {
                 ui.label("分钟");
             });
             self.dirty |= ui.checkbox(&mut self.prefs.apply_automatic, "自动抓取成功后应用壁纸").changed();
-            let side = s.preview.as_ref().map_or(self.prefs.grid * 550, |p| p.observation.side());
+            let side = s.preview.as_ref().map_or(self.prefs.grid * TILE, |p| p.observation.side());
             let tip = format!("100% = 原图像素尺寸；主屏 {}×{}。\n完整地球适配主屏约 {:.1}%。\n下一次自动抓取成功后应用，完整原图不缩放。",
                 self.screen.0, self.screen.1, 100. * self.screen.0.min(self.screen.1) as f32 / side as f32);
             ui.horizontal(|ui| {
@@ -266,6 +284,10 @@ impl App {
         egui::Window::new("项目说明").open(&mut self.about_open).collapsible(false).resizable(true)
             .default_width(600.).min_width(300.).show(ctx, |ui| {
                 ui.heading(format!("{APP_NAME} {}", display_version()));
+                if button(ui, "快速上手", 120., Tone::Neutral).clicked() {
+                    self.guide_no_repeat = !self.prefs.show_guide_on_start;
+                    self.guide_open = true;
+                }
                 ui.add_space(8.);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.;
