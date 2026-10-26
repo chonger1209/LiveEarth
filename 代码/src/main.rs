@@ -95,15 +95,6 @@ impl App {
             .unwrap()
             .push("MiSans".into());
         ctx.set_fonts(fonts);
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(20, 25, 31);
-        visuals.window_fill = egui::Color32::from_rgb(24, 30, 37);
-        ctx.set_visuals(visuals);
-        ctx.style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(9., 5.);
-            s.spacing.button_padding = egui::vec2(9., 5.);
-            s.override_font_id = Some(egui::FontId::proportional(15.));
-        });
         widgets::style(ctx);
         let (mut prefs, mut notice) = settings::load(&data);
         match std::env::current_exe().and_then(|p| {
@@ -332,9 +323,9 @@ impl eframe::App for App {
                     {
                         ui.add(
                             egui::Label::new(egui::RichText::new(&f.message).color(if f.error {
-                                widgets::ERROR
+                                widgets::colors(ui).error
                             } else {
-                                widgets::SUCCESS
+                                widgets::colors(ui).success
                             }))
                             .truncate(),
                         )
@@ -358,7 +349,7 @@ impl eframe::App for App {
                         s.saved, s.missing
                     ));
                     if let Some(e) = &s.log_error {
-                        ui.colored_label(egui::Color32::LIGHT_RED, "日志未落盘")
+                        ui.colored_label(widgets::colors(ui).error, "日志未落盘")
                             .on_hover_text(e);
                     }
                 });

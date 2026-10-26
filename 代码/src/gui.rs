@@ -110,7 +110,7 @@ impl App {
         ui.label("照片目录");
         egui::Frame::new()
             .inner_margin(4.)
-            .stroke(egui::Stroke::new(1_f32, widgets::STOPPED))
+            .stroke(egui::Stroke::new(1_f32, widgets::colors(ui).border))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.add(egui::Label::new(&self.photos).truncate())
@@ -150,9 +150,9 @@ impl App {
             let state = s.activity_text();
             ui.add(
                 egui::Label::new(egui::RichText::new(state).size(13.).color(if s.error {
-                    widgets::ERROR
+                    widgets::colors(ui).error
                 } else {
-                    widgets::SUCCESS
+                    widgets::colors(ui).success
                 }))
                 .truncate(),
             );

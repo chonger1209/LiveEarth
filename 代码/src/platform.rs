@@ -177,15 +177,37 @@ mod native {
         Ok(startup_value("LiveEarth")?
             .is_some_and(|v| startup_command(exe, data).is_ok_and(|c| c == v)))
     }
-    pub fn set_autostart(enable: bool, exe: &Path, data: &Path) -> Result<()> {
+    pub struct AutostartChange {
+        name: String,
+        previous: Option<String>,
+        applied: Option<String>,
+    }
+    impl AutostartChange {
+        pub fn rollback(self) -> Result<()> {
+            ensure!(
+                startup_value(&self.name)? == self.applied,
+                "自启动项已被其他操作更改，未覆盖较新的登记"
+            );
+            set_startup_value(&self.name, self.previous.as_deref())
+        }
+    }
+    pub(crate) fn replace_named_autostart(
+        name: &str,
+        command: Option<String>,
+    ) -> Result<AutostartChange> {
+        let previous = startup_value(name)?;
+        set_startup_value(name, command.as_deref())?;
+        Ok(AutostartChange {
+            name: name.into(),
+            previous,
+            applied: command,
+        })
+    }
+    pub fn set_autostart(enable: bool, exe: &Path, data: &Path) -> Result<AutostartChange> {
         let command = enable.then(|| startup_command(exe, data)).transpose()?;
-        let previous = startup_value("LiveEarth")?;
-        let own = startup_command(exe, data)?;
-        ensure!(
-            previous.as_ref().is_none_or(|v| v == &own),
-            "LiveEarth 自启动项指向其他安装位置，未覆盖"
-        );
-        set_startup_value("LiveEarth", command.as_deref())
+        // Explicit user action may replace the single LiveEarth startup entry.
+        // Automatic migration below deliberately retains its ownership checks.
+        replace_named_autostart("LiveEarth", command)
     }
     pub fn migrate_autostart(exe: &Path, data: &Path) -> Result<()> {
         migrate_named_autostart("EarthLiveV2", "LiveEarth", exe, data)
@@ -528,7 +550,10 @@ mod native {
 }
 #[cfg(windows)]
 pub use native::{
-    autostart_enabled, migrate_autostart, pick_directory, set_autostart, window_visible,
+    AutostartChange, autostart_enabled, migrate_autostart, pick_directory, set_autostart,
+    window_visible,
 };
 #[cfg(all(test, windows))]
-pub(crate) use native::{migrate_named_autostart, set_startup_value, startup_value};
+pub(crate) use native::{
+    migrate_named_autostart, replace_named_autostart, set_startup_value, startup_value,
+};

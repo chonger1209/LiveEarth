@@ -478,19 +478,34 @@ fn accept_settings(
     if next.photos != current.photos {
         settings::validate_photo_directory(&next.photos)?;
     }
-    let startup_changed = next.autostart != current.autostart;
-    if startup_changed {
-        crate::platform::set_autostart(next.autostart, &std::env::current_exe()?, data)?;
-    }
-    if let Err(error) = settings::save(data, &next) {
-        if startup_changed {
-            crate::platform::set_autostart(current.autostart, &std::env::current_exe()?, data)
-                .context("配置保存失败，恢复 Windows 自启动也失败；请检查启动设置")?;
+    let startup_change = if next.autostart != current.autostart {
+        Some(crate::platform::set_autostart(
+            next.autostart,
+            &std::env::current_exe()?,
+            data,
+        )?)
+    } else {
+        None
+    };
+    persist_settings(data, &next, startup_change)?;
+    Ok(next)
+}
+fn persist_settings(
+    data: &std::path::Path,
+    next: &Preferences,
+    startup_change: Option<crate::platform::AutostartChange>,
+) -> Result<()> {
+    if let Err(error) = settings::save(data, next) {
+        if let Some(change) = startup_change {
+            change
+                .rollback()
+                .context("配置保存失败，恢复原自启动记录也失败；请检查启动设置")?;
         }
         return Err(error.context("设置保存失败"));
     }
-    Ok(next)
+    Ok(())
 }
+
 impl Service {
     fn spawn_with(
         data: PathBuf,

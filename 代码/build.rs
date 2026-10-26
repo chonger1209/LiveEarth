@@ -99,9 +99,9 @@ fn version_block(
     put16(&mut bytes, 0, length);
     bytes
 }
-fn version_resource(release: u32) -> Vec<u8> {
-    let numeric = format!("2.{release}.0.0");
-    let display = format!("V2.{release:03}");
+fn version_resource([major, minor, patch]: [u16; 3]) -> Vec<u8> {
+    let numeric = format!("{major}.{minor}.{patch}.0");
+    let display = env::var("CARGO_PKG_VERSION").unwrap();
     let strings = [
         ("FileDescription", "LiveEarth"),
         ("ProductName", "LiveEarth"),
@@ -122,10 +122,10 @@ fn version_resource(release: u32) -> Vec<u8> {
     let fixed: Vec<u8> = [
         0xFEEF04BDu32,
         0x10000,
-        (2 << 16) | release,
-        0,
-        (2 << 16) | release,
-        0,
+        (u32::from(major) << 16) | u32::from(minor),
+        u32::from(patch) << 16,
+        (u32::from(major) << 16) | u32::from(minor),
+        u32::from(patch) << 16,
         0x3F,
         0,
         0x40004,
@@ -146,18 +146,12 @@ fn version_resource(release: u32) -> Vec<u8> {
     )
 }
 fn main() {
-    let minor: u32 = env::var("CARGO_PKG_VERSION_MINOR")
-        .unwrap()
-        .parse()
-        .unwrap();
-    let patch: u32 = env::var("CARGO_PKG_VERSION_PATCH")
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(
-        env::var("CARGO_PKG_VERSION_MAJOR").unwrap() == "0" && minor < 100 && patch < 10,
-        "V2 发布编号使用 Cargo 0.0.0–0.99.9，patch 达到 9 后递增 minor"
-    );
+    let version = ["MAJOR", "MINOR", "PATCH"].map(|part| {
+        env::var(format!("CARGO_PKG_VERSION_{part}"))
+            .unwrap()
+            .parse::<u16>()
+            .expect("Windows 版本的每个数字必须在 0–65535 范围内")
+    });
     println!("cargo:rerun-if-changed=assets/app-icon.png");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let original = image::open("assets/app-icon.png").expect("selected app icon");
@@ -211,7 +205,7 @@ fn main() {
                     .collect(),
             ),
             (14, vec![(101, group)]),
-            (16, vec![(1, version_resource(minor * 10 + patch))]),
+            (16, vec![(1, version_resource(version))]),
         ];
         let obj = out.join("icon-resource.o");
         fs::write(&obj, resource_object(&resources)).unwrap();

@@ -840,3 +840,57 @@ fn activity_text_preserves_phase_cancel_and_exit_semantics() {
     snapshot.enabled = false;
     assert_eq!(snapshot.activity_text(), "已停止");
 }
+
+#[test]
+fn autostart_replaces_old_location_and_rolls_back_exact_record_on_save_failure() {
+    use crate::platform::{replace_named_autostart, set_startup_value, startup_value};
+    let name = format!("LiveEarth.Test.Replace.{}", std::process::id());
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = set_startup_value(&self.0, None);
+        }
+    }
+    let _cleanup = Cleanup(name.clone());
+    let old = "\"C:/Old/LiveEarth.exe\" --data-dir \"C:/Old/data\" --startup";
+    let new = "\"D:/New/LiveEarth.exe\" --data-dir \"E:/New/data\" --startup";
+    set_startup_value(&name, Some(old)).unwrap();
+    let change = replace_named_autostart(&name, Some(new.into())).unwrap();
+    assert_eq!(startup_value(&name).unwrap().as_deref(), Some(new));
+    let blocked = tempfile::tempdir().unwrap();
+    std::fs::create_dir(blocked.path().join("settings.json")).unwrap();
+    let mut preferences = Preferences::new(blocked.path());
+    preferences.autostart = true;
+    assert!(persist_settings(blocked.path(), &preferences, Some(change)).is_err());
+    assert_eq!(startup_value(&name).unwrap().as_deref(), Some(old));
+    let good = tempfile::tempdir().unwrap();
+    let change = replace_named_autostart(&name, Some(new.into())).unwrap();
+    persist_settings(good.path(), &preferences, Some(change)).unwrap();
+    assert_eq!(startup_value(&name).unwrap().as_deref(), Some(new));
+    let change = replace_named_autostart(&name, None).unwrap();
+    assert!(startup_value(&name).unwrap().is_none());
+    change.rollback().unwrap();
+    assert_eq!(startup_value(&name).unwrap().as_deref(), Some(new));
+    replace_named_autostart(&name, None).unwrap();
+    assert!(startup_value(&name).unwrap().is_none());
+}
+
+#[test]
+fn autostart_rollback_does_not_overwrite_a_newer_choice() {
+    use crate::platform::{replace_named_autostart, set_startup_value, startup_value};
+    let name = format!("LiveEarth.Test.Newer.{}", std::process::id());
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = set_startup_value(&self.0, None);
+        }
+    }
+    let _cleanup = Cleanup(name.clone());
+    let change = replace_named_autostart(&name, Some("first choice".into())).unwrap();
+    set_startup_value(&name, Some("newer choice")).unwrap();
+    assert!(change.rollback().is_err());
+    assert_eq!(
+        startup_value(&name).unwrap().as_deref(),
+        Some("newer choice")
+    );
+}
