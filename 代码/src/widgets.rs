@@ -95,6 +95,12 @@ pub enum Tone {
     Stopped,
 }
 
+fn opaque_shade(color: Color32, factor: f32) -> Color32 {
+    let [r, g, b] = [color.r(), color.g(), color.b()]
+        .map(|value| (f32::from(value) * factor).round().clamp(0., 255.) as u8);
+    Color32::from_rgb(r, g, b)
+}
+
 fn palette(widgets: &mut egui::style::Widgets, tone: Tone, colors: ThemeColors) {
     let (fill, edge) = match tone {
         Tone::Neutral => colors.neutral,
@@ -108,9 +114,9 @@ fn palette(widgets: &mut egui::style::Widgets, tone: Tone, colors: ThemeColors) 
         (&mut widgets.active, if colors.dark { 0.78 } else { 0.90 }),
     ] {
         w.corner_radius = 4.into();
-        w.bg_fill = fill.gamma_multiply(factor);
+        w.bg_fill = opaque_shade(fill, factor);
         w.weak_bg_fill = w.bg_fill;
-        w.bg_stroke = Stroke::new(1.5_f32, edge.gamma_multiply(factor));
+        w.bg_stroke = Stroke::new(1.5_f32, opaque_shade(edge, factor));
         w.fg_stroke = Stroke::new(1_f32, colors.foreground);
         w.expansion = 0.;
     }
@@ -195,6 +201,36 @@ pub fn activity(ui: &mut Ui, activity: Activity) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_states_are_opaque_and_distinct_in_both_themes() {
+        for dark in [true, false] {
+            let colors = ThemeColors::for_theme(dark);
+            for tone in [Tone::Neutral, Tone::Selected, Tone::Running, Tone::Stopped] {
+                let mut visuals = if dark {
+                    egui::Visuals::dark()
+                } else {
+                    egui::Visuals::light()
+                };
+                palette(&mut visuals.widgets, tone, colors);
+                let states = [
+                    &visuals.widgets.inactive,
+                    &visuals.widgets.hovered,
+                    &visuals.widgets.active,
+                ];
+                for state in states {
+                    assert_eq!(state.bg_fill.a(), 255);
+                    assert_eq!(state.bg_stroke.color.a(), 255);
+                }
+                assert_ne!(states[0].bg_fill, states[1].bg_fill);
+                assert_ne!(states[1].bg_fill, states[2].bg_fill);
+                if !dark {
+                    assert!(states[1].bg_fill.r() < states[0].bg_fill.r());
+                    assert!(states[2].bg_fill.r() < states[1].bg_fill.r());
+                }
+            }
+        }
+    }
 
     #[test]
     fn both_themes_keep_layout_and_readable_colors() {
