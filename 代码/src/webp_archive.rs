@@ -5,7 +5,9 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Write};
+use std::io::{BufRead, Cursor, Seek, Write};
+const MAX_METADATA_BYTES: usize = 128 * 1024;
+const MAX_IMAGE_MEMORY: usize = 512 * 1024 * 1024;
 const PREFIX: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:el="https://earthlive.local/archive/2/" el:archive=""#;
 const SUFFIX: &str = r#""/></rdf:RDF></x:xmpmeta>"#;
 #[derive(Serialize, Deserialize)]
@@ -59,8 +61,7 @@ pub fn decode(bytes: &[u8], stop: &Stop) -> Result<Decoded> {
         u32::from_le_bytes(bytes[4..8].try_into()?) as usize + 8 == bytes.len(),
         "WebP 不完整或含多余数据"
     );
-    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes))?;
-    decoder.set_memory_limit(512 * 1024 * 1024);
+    let mut decoder = metadata_decoder(Cursor::new(bytes))?;
     let (w, h) = decoder.dimensions();
     ensure!(
         w > 0
@@ -78,7 +79,11 @@ pub fn decode(bytes: &[u8], stop: &Stop) -> Result<Decoded> {
         decoder.icc_profile()?.unwrap_or_default() == profile(&envelope.colors)?,
         "WebP 色彩配置与归档说明不一致"
     );
-    let mut pixels = vec![0; decoder.output_buffer_size().context("WebP 尺寸无效")?];
+    decoder.set_memory_limit(MAX_IMAGE_MEMORY);
+    let size = decoder.output_buffer_size().context("WebP 尺寸无效")?;
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(size)?;
+    pixels.resize(size, 0);
     decoder
         .read_image(&mut pixels)
         .context("WebP 像素解码失败")?;
@@ -232,7 +237,7 @@ fn inverse(a: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3]> {
 }
 
 fn parse_envelope(xmp: &[u8]) -> Result<Envelope> {
-    ensure!(xmp.len() <= 131072, "归档说明过大");
+    ensure!(xmp.len() <= MAX_METADATA_BYTES, "归档说明过大");
     let text = std::str::from_utf8(xmp)?;
     let hex = text
         .strip_prefix(PREFIX)
@@ -253,8 +258,14 @@ fn parse_envelope(xmp: &[u8]) -> Result<Envelope> {
     Ok(envelope)
 }
 
-pub(crate) fn read_note(reader: impl std::io::BufRead + std::io::Seek) -> Result<String> {
+fn metadata_decoder<R: BufRead + Seek>(reader: R) -> Result<image_webp::WebPDecoder<R>> {
     let mut decoder = image_webp::WebPDecoder::new(reader)?;
+    decoder.set_memory_limit(MAX_METADATA_BYTES);
+    Ok(decoder)
+}
+
+pub(crate) fn read_note(reader: impl BufRead + Seek) -> Result<String> {
+    let mut decoder = metadata_decoder(reader)?;
     let xmp = decoder.xmp_metadata()?.context("缺少归档说明")?;
     Ok(parse_envelope(&xmp)?.note)
 }

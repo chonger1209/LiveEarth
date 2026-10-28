@@ -387,7 +387,7 @@ mod native {
                     return LRESULT(1);
                 }
                 WM_QUERYENDSESSION => {
-                    state.handle.send(Command::Shutdown);
+                    // Windows may still cancel shutdown; wait for WM_ENDSESSION.
                     return LRESULT(1);
                 }
                 WM_ENDSESSION if wparam.0 != 0 => {
@@ -395,6 +395,7 @@ mod native {
                     return LRESULT(0);
                 }
                 WM_CLOSE => {
+                    state.handle.send(Command::Shutdown);
                     unsafe {
                         let _ = DestroyWindow(hwnd);
                     }

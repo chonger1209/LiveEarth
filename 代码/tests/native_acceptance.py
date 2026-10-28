@@ -220,6 +220,13 @@ def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, s
         else:
             wait(lambda: user.IsWindowVisible(main) and not user.IsIconic(main))
         print(f"Startup={startup}, minimize={start_minimized}, tray={minimize_to_tray}: PASS", flush=True)
+        # A canceled Windows session-end must leave this isolated application alive.
+        for window in (main, tray):
+            assert user.SendMessageW(window, 0x0011, 0, 0) == 1  # WM_QUERYENDSESSION
+            user.SendMessageW(window, 0x0016, 0, 0)  # WM_ENDSESSION, canceled
+        time.sleep(0.4)
+        assert process.poll() is None, "canceled shutdown terminated the application"
+        print("Canceled Windows shutdown retains process: PASS", flush=True)
         sample_cpu("startup_hidden" if hidden else "startup_visible")
         if download:
             wait(lambda: json.loads((directory / "settings.json").read_text(encoding="utf-8")).get("last") is not None, 60)
@@ -393,7 +400,7 @@ def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, s
             wait(lambda: not user.IsWindowVisible(main))
     finally:
         if tray and process.poll() is None:
-            user.PostMessageW(tray, 0x0011, 0, 0)
+            user.PostMessageW(tray, 0x0010, 0, 0)  # Explicit background-window close.
         try:
             process.wait(timeout=45)
         except subprocess.TimeoutExpired:

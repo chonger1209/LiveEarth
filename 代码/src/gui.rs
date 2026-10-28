@@ -28,121 +28,8 @@ impl App {
     pub(super) fn controls(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         let editable = s.can_configure_capture() && self.pending.is_none() && self.picker.is_none();
         ui.heading("影像与历史");
-        ui.add_enabled_ui(editable, |ui| {
-            ui.horizontal(|ui| {
-                let width = widgets::third_width(ui);
-                for mode in [
-                    CaptureMode::Latest,
-                    CaptureMode::AtTime,
-                    CaptureMode::History,
-                ] {
-                    if button(
-                        ui,
-                        mode.label(),
-                        width,
-                        if self.mode == mode {
-                            Tone::Selected
-                        } else {
-                            Tone::Neutral
-                        },
-                    )
-                    .clicked()
-                    {
-                        self.mode = mode;
-                    }
-                }
-            });
-            if self.mode != CaptureMode::Latest {
-                self.dirty |= ui
-                    .checkbox(&mut self.prefs.beijing, "输入使用北京时间")
-                    .on_hover_text("勾选为 UTC+8，未勾选为 UTC。")
-                    .changed();
-                ui.horizontal(|ui| {
-                    ui.label(if self.mode == CaptureMode::AtTime {
-                        "观测时刻"
-                    } else {
-                        "开始时刻"
-                    });
-                    ui.add(egui::TextEdit::singleline(&mut self.from).desired_width(210.))
-                        .on_hover_text("例如 2026-10-23 15:30，须落在 10 分钟边界。");
-                });
-                if self.mode == CaptureMode::History {
-                    ui.horizontal(|ui| {
-                        ui.label("结束时刻");
-                        ui.add(egui::TextEdit::singleline(&mut self.until).desired_width(210.))
-                            .on_hover_text("包含结束时刻，须落在 10 分钟边界。");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("抓取步长");
-                        egui::ComboBox::from_id_salt("step")
-                            .selected_text(format!("{} 分钟", self.step))
-                            .show_ui(ui, |ui| {
-                                for n in [10, 20, 30, 60] {
-                                    ui.selectable_value(&mut self.step, n, format!("{n} 分钟"));
-                                }
-                            });
-                    });
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label("抓取分辨率");
-                egui::ComboBox::from_id_salt("grid")
-                    .selected_text(format!(
-                        "{}×{}",
-                        self.prefs.grid * TILE,
-                        self.prefs.grid * TILE
-                    ))
-                    .show_ui(ui, |ui| {
-                        for n in [1, 2, 4, 8, 16] {
-                            self.dirty |= ui
-                                .selectable_value(
-                                    &mut self.prefs.grid,
-                                    n,
-                                    format!("{}×{}", n * TILE, n * TILE),
-                                )
-                                .changed();
-                        }
-                    });
-            });
-            ui.checkbox(&mut self.refresh, "重新下载并核对已有帧")
-                .on_hover_text("仅用于“抓取本次”；相同内容不重复保存，源站修订另存文件。");
-        });
-        ui.label("照片目录");
-        egui::Frame::new()
-            .inner_margin(4.)
-            .stroke(egui::Stroke::new(1_f32, widgets::colors(ui).border))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(&self.photos).truncate())
-                    .on_hover_text(&self.photos);
-            });
-        ui.horizontal(|ui| {
-            let width = widgets::third_width(ui);
-            if button(ui, "打开目录", width, Tone::Neutral).clicked()
-                && let Err(e) = platform::open_directory(&self.prefs.photos)
-            {
-                self.feedback(format!("{e:#}"), true);
-            }
-            if ui
-                .add_enabled_ui(editable, |ui| button(ui, "修改目录", width, Tone::Neutral))
-                .inner
-                .clicked()
-            {
-                self.choose_directory(ui.ctx());
-            }
-            if ui
-                .add_enabled_ui(editable, |ui| button(ui, "抓取本次", width, Tone::Neutral))
-                .inner
-                .clicked()
-            {
-                match self.selection() {
-                    Ok(selection) => {
-                        self.submit_settings(Some(AfterSave::Capture(selection, self.refresh)))
-                    }
-                    Err(e) => self.feedback(format!("输入错误：{e:#}"), true),
-                }
-            }
-        });
+        ui.add_enabled_ui(editable, |ui| self.capture_options(ui));
+        self.directory_controls(ui, editable);
         ui.separator();
         ui.horizontal(|ui| {
             ui.heading("定时抓取");
@@ -157,52 +44,7 @@ impl App {
                 .truncate(),
             );
         });
-        ui.horizontal(|ui| {
-            let width = if s.busy {
-                (ui.available_width() - ui.spacing().item_spacing.x) / 2.
-            } else {
-                ui.available_width()
-            };
-            if ui
-                .add_enabled_ui(
-                    !s.exiting && self.pending.is_none() && self.picker.is_none(),
-                    |ui| {
-                        button(
-                            ui,
-                            if s.enabled {
-                                "停止抓取"
-                            } else {
-                                "开始抓取"
-                            },
-                            width,
-                            if s.enabled {
-                                Tone::Running
-                            } else {
-                                Tone::Stopped
-                            },
-                        )
-                    },
-                )
-                .inner
-                .clicked()
-            {
-                if s.enabled {
-                    self.service.handle.send(Command::SetEnabled(false));
-                } else {
-                    self.submit_settings(Some(AfterSave::Start));
-                }
-            }
-            if s.busy
-                && ui
-                    .add_enabled_ui(!s.exiting, |ui| {
-                        button(ui, "取消当前任务", width, Tone::Neutral)
-                    })
-                    .inner
-                    .clicked()
-            {
-                self.service.handle.send(Command::Cancel);
-            }
-        });
+        self.schedule_buttons(ui, s);
         ui.add_enabled_ui(editable, |ui| {
             ui.horizontal(|ui| {
                 ui.label("检查间隔");
@@ -246,12 +88,186 @@ impl App {
         });
     }
 
+    fn capture_options(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let width = widgets::third_width(ui);
+            for mode in [
+                CaptureMode::Latest,
+                CaptureMode::AtTime,
+                CaptureMode::History,
+            ] {
+                if button(
+                    ui,
+                    mode.label(),
+                    width,
+                    if self.mode == mode {
+                        Tone::Selected
+                    } else {
+                        Tone::Neutral
+                    },
+                )
+                .clicked()
+                {
+                    self.mode = mode;
+                }
+            }
+        });
+        self.time_inputs(ui);
+        ui.horizontal(|ui| {
+            ui.label("抓取分辨率");
+            egui::ComboBox::from_id_salt("grid")
+                .selected_text(format!(
+                    "{}×{}",
+                    self.prefs.grid * TILE,
+                    self.prefs.grid * TILE
+                ))
+                .show_ui(ui, |ui| {
+                    for n in [1, 2, 4, 8, 16] {
+                        self.dirty |= ui
+                            .selectable_value(
+                                &mut self.prefs.grid,
+                                n,
+                                format!("{}×{}", n * TILE, n * TILE),
+                            )
+                            .changed();
+                    }
+                });
+        });
+        ui.checkbox(&mut self.refresh, "重新下载并核对已有帧")
+            .on_hover_text("仅用于“抓取本次”；相同内容不重复保存，源站修订另存文件。");
+    }
+
+    fn time_inputs(&mut self, ui: &mut egui::Ui) {
+        if self.mode == CaptureMode::Latest {
+            return;
+        }
+        self.dirty |= ui
+            .checkbox(&mut self.prefs.beijing, "输入使用北京时间")
+            .on_hover_text("勾选为 UTC+8，未勾选为 UTC。")
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label(if self.mode == CaptureMode::AtTime {
+                "观测时刻"
+            } else {
+                "开始时刻"
+            });
+            ui.add(egui::TextEdit::singleline(&mut self.from).desired_width(210.))
+                .on_hover_text("例如 2026-10-23 15:30，须落在 10 分钟边界。");
+        });
+        if self.mode != CaptureMode::History {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("结束时刻");
+            ui.add(egui::TextEdit::singleline(&mut self.until).desired_width(210.))
+                .on_hover_text("包含结束时刻，须落在 10 分钟边界。");
+        });
+        ui.horizontal(|ui| {
+            ui.label("抓取步长");
+            egui::ComboBox::from_id_salt("step")
+                .selected_text(format!("{} 分钟", self.step))
+                .show_ui(ui, |ui| {
+                    for n in [10, 20, 30, 60] {
+                        ui.selectable_value(&mut self.step, n, format!("{n} 分钟"));
+                    }
+                });
+        });
+    }
+
+    fn directory_controls(&mut self, ui: &mut egui::Ui, editable: bool) {
+        ui.label("照片目录");
+        egui::Frame::new()
+            .inner_margin(4.)
+            .stroke(egui::Stroke::new(1_f32, widgets::colors(ui).border))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(egui::Label::new(&self.photos).truncate())
+                    .on_hover_text(&self.photos);
+            });
+        ui.horizontal(|ui| {
+            let width = widgets::third_width(ui);
+            if button(ui, "打开目录", width, Tone::Neutral).clicked()
+                && let Err(e) = platform::open_directory(&self.prefs.photos)
+            {
+                self.feedback(format!("{e:#}"), true);
+            }
+            if ui
+                .add_enabled_ui(editable, |ui| button(ui, "修改目录", width, Tone::Neutral))
+                .inner
+                .clicked()
+            {
+                self.choose_directory(ui.ctx());
+            }
+            if ui
+                .add_enabled_ui(editable, |ui| button(ui, "抓取本次", width, Tone::Neutral))
+                .inner
+                .clicked()
+            {
+                match self.selection() {
+                    Ok(selection) => {
+                        self.submit_settings(Some(AfterSave::Capture(selection, self.refresh)))
+                    }
+                    Err(e) => self.feedback(format!("输入错误：{e:#}"), true),
+                }
+            }
+        });
+    }
+
+    fn schedule_buttons(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
+        ui.horizontal(|ui| {
+            let width = if s.busy {
+                (ui.available_width() - ui.spacing().item_spacing.x) / 2.
+            } else {
+                ui.available_width()
+            };
+            if ui
+                .add_enabled_ui(
+                    s.accepts_commands() && self.pending.is_none() && self.picker.is_none(),
+                    |ui| {
+                        button(
+                            ui,
+                            if s.enabled {
+                                "停止抓取"
+                            } else {
+                                "开始抓取"
+                            },
+                            width,
+                            if s.enabled {
+                                Tone::Running
+                            } else {
+                                Tone::Stopped
+                            },
+                        )
+                    },
+                )
+                .inner
+                .clicked()
+            {
+                if s.enabled {
+                    self.service.handle.send(Command::SetEnabled(false));
+                } else {
+                    self.submit_settings(Some(AfterSave::Start));
+                }
+            }
+            if s.busy
+                && ui
+                    .add_enabled_ui(!s.exiting, |ui| {
+                        button(ui, "取消当前任务", width, Tone::Neutral)
+                    })
+                    .inner
+                    .clicked()
+            {
+                self.service.handle.send(Command::Cancel);
+            }
+        });
+    }
+
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
-        let capture_editable =
-            self.service.handle.snapshot().can_configure_capture() && self.picker.is_none();
+        let s = self.service.handle.snapshot();
+        let capture_editable = s.can_configure_capture() && self.picker.is_none();
         egui::Window::new("设置").open(&mut self.settings_open).collapsible(false).resizable(false)
             .default_width(360.).show(ctx, |ui| {
-                ui.add_enabled_ui(self.pending.is_none(), |ui| {
+                ui.add_enabled_ui(s.accepts_commands() && self.pending.is_none(), |ui| {
                     ui.heading("照片保留");
                     ui.add_enabled_ui(capture_editable, |ui| {
                         ui.horizontal(|ui| {

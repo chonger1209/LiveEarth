@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::RetryDelay;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 #[test]
 fn session_totals_survive_cancel_and_error_without_counting_reuse() {
@@ -893,4 +894,114 @@ fn autostart_rollback_does_not_overwrite_a_newer_choice() {
         startup_value(&name).unwrap().as_deref(),
         Some("newer choice")
     );
+}
+
+#[test]
+fn extreme_retry_after_keeps_scheduler_alive_and_can_be_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut prefs = Preferences::new(dir.path());
+    prefs.automatic = true;
+    let runner: Runner = Arc::new(|_, _, _, _| {
+        Err(anyhow::Error::new(HttpFailure(429)).context(RetryDelay(u64::MAX)))
+    });
+    let mut service = Service::spawn_with(
+        dir.path().into(),
+        prefs,
+        None,
+        Arc::new(|| {}),
+        runner,
+        timing(10000),
+    );
+    until(|| service.handle.snapshot().retrying);
+    let snapshot = service.handle.snapshot();
+    assert!(snapshot.enabled && !snapshot.exited);
+    let remaining = snapshot.next_check.unwrap() - Utc::now();
+    assert!(remaining >= chrono::Duration::hours(23) && remaining <= chrono::Duration::hours(25));
+    service.handle.send(Command::SetEnabled(false));
+    until(|| !service.handle.snapshot().enabled);
+    service.shutdown();
+    assert!(service.handle.snapshot().exited);
+}
+
+#[test]
+fn source_data_fault_recovers_without_disabling_saved_automatic_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut prefs = Preferences::new(dir.path());
+    prefs.automatic = true;
+    settings::save(dir.path(), &prefs).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let runner: Runner = Arc::new(move |_, _, _, _| {
+        if count.fetch_add(1, SeqCst) == 0 {
+            Err(SourceDataError("临时损坏的源站数据").into())
+        } else {
+            success()
+        }
+    });
+    let mut service = Service::spawn_with(
+        dir.path().into(),
+        prefs,
+        None,
+        Arc::new(|| {}),
+        runner,
+        timing(10000),
+    );
+    until(|| service.handle.snapshot().last_success.is_some());
+    assert_eq!(calls.load(SeqCst), 2);
+    assert!(service.handle.snapshot().enabled);
+    assert!(settings::load(dir.path()).0.automatic);
+    service.shutdown();
+}
+
+#[test]
+fn scheduler_panic_is_visible_and_dead_channel_still_accepts_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let panic_once = Arc::new(AtomicBool::new(true));
+    let trigger = panic_once.clone();
+    let wake = Arc::new(move || {
+        assert!(
+            !trigger.swap(false, SeqCst),
+            "injected scheduler callback failure"
+        );
+    });
+    let mut service = Service::spawn_with(
+        dir.path().into(),
+        Preferences::new(dir.path()),
+        None,
+        wake,
+        Arc::new(|_, _, _, _| success()),
+        timing(10000),
+    );
+    until(|| service.join.as_ref().unwrap().is_finished());
+    let stopped = service.handle.snapshot();
+    assert!(stopped.exited && stopped.error && !stopped.exiting);
+    assert!(!stopped.accepts_commands() && !stopped.can_configure_capture());
+    assert!(stopped.status.contains("后台已停止"));
+    service.handle.send(Command::SetEnabled(true));
+    assert!(!service.handle.snapshot().enabled);
+    assert_eq!(service.handle.snapshot().logs.len(), stopped.logs.len());
+    service.shutdown();
+    assert!(service.handle.snapshot().exiting);
+}
+
+#[test]
+fn invalid_internal_deadline_reports_failure_instead_of_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut prefs = Preferences::new(dir.path());
+    prefs.automatic = true;
+    let mut clock = timing(10000);
+    clock.interval_override = Some(Duration::MAX);
+    let mut service = Service::spawn_with(
+        dir.path().into(),
+        prefs,
+        None,
+        Arc::new(|| {}),
+        Arc::new(|_, _, _, _| success()),
+        clock,
+    );
+    until(|| service.handle.snapshot().exited);
+    let stopped = service.handle.snapshot();
+    assert!(stopped.error && !stopped.enabled && !stopped.busy);
+    assert!(stopped.status.contains("下次检查时间超出系统范围"));
+    service.shutdown();
 }

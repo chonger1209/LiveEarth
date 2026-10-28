@@ -1,6 +1,6 @@
 [package]
 name = "earthlive-v2"
-version = "2.0.49"
+version = "2.0.50"
 edition = "2024"
 default-run = "LiveEarth"
 license = "MIT"

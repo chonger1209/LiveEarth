@@ -26,7 +26,7 @@ impl App {
                 }
                 ui.add_space(12.);
                 ui.separator();
-                ui.add_enabled_ui(self.pending.is_none(), |ui| {
+                ui.add_enabled_ui(self.service.handle.snapshot().accepts_commands() && self.pending.is_none(), |ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.guide_no_repeat, "不再自动显示");
                         confirm = button(ui, "知道了，开始使用", 170., Tone::Neutral).clicked();

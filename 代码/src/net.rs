@@ -1,5 +1,5 @@
 use crate::domain::{ORIGIN, Observation, Stop, metadata};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use reqwest::{Client, StatusCode};
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
@@ -14,12 +14,31 @@ impl std::fmt::Display for HttpFailure {
 impl std::error::Error for HttpFailure {}
 #[derive(Debug)]
 pub struct RetryDelay(pub u64);
+impl RetryDelay {
+    pub const MAX_SECONDS: u64 = 24 * 60 * 60;
+
+    pub fn duration(&self) -> Duration {
+        Duration::from_secs(self.0.min(Self::MAX_SECONDS))
+    }
+}
 impl std::fmt::Display for RetryDelay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 > Self::MAX_SECONDS {
+            return f.write_str("源站重试时间过大，按最多 24 小时处理");
+        }
         write!(f, "源站要求 {} 秒后重试", self.0)
     }
 }
 impl std::error::Error for RetryDelay {}
+
+#[derive(Debug)]
+pub(crate) struct SourceDataError(pub &'static str);
+impl std::fmt::Display for SourceDataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for SourceDataError {}
 
 #[derive(Clone)]
 pub struct Source {
@@ -58,7 +77,7 @@ impl Source {
     }
     #[cfg(test)]
     pub(crate) fn local(origin: &str) -> Result<Self> {
-        ensure!(
+        anyhow::ensure!(
             origin.starts_with("http://127.0.0.1:"),
             "测试只允许回环地址"
         );
@@ -66,7 +85,7 @@ impl Source {
     }
     pub async fn latest(&self, grid: u32, stop: &Stop) -> Result<Observation> {
         metadata(&self.get("/latest.json", 65536, stop).await?, grid)
-            .context("解析同产品最新观测失败")
+            .context(SourceDataError("源站最新观测信息无效"))
     }
     pub async fn tile(&self, frame: &Observation, x: u32, y: u32, stop: &Stop) -> Result<Vec<u8>> {
         self.get(&frame.tile_path(x, y)?, 4 * 1024 * 1024, stop)
@@ -110,10 +129,9 @@ impl Source {
                 }
                 return Err(HttpFailure(status.as_u16()).into());
             }
-            ensure!(
-                response.content_length().is_none_or(|n| n <= limit as u64),
-                "响应超过大小限制"
-            );
+            if response.content_length().is_some_and(|n| n > limit as u64) {
+                return Err(SourceDataError("源站响应超过大小限制").into());
+            }
             let mut bytes = Vec::new();
             loop {
                 let chunk = tokio::select! {
@@ -123,7 +141,9 @@ impl Source {
                 let Some(chunk) = chunk else {
                     break;
                 };
-                ensure!(bytes.len() + chunk.len() <= limit, "响应超过大小限制");
+                if chunk.len() > limit.saturating_sub(bytes.len()) {
+                    return Err(SourceDataError("源站响应超过大小限制").into());
+                }
                 bytes.extend_from_slice(&chunk);
             }
             stop.check()?;

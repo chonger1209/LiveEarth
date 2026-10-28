@@ -1,7 +1,7 @@
 use crate::{
     domain::{Observation, Stop, TILE},
     imaging::{Assembly, decode},
-    net::{HttpFailure, Source},
+    net::{HttpFailure, Source, SourceDataError},
     storage,
 };
 use anyhow::{Context, Result, ensure};
@@ -193,9 +193,12 @@ async fn fetch_frame(
         };
         let (x, y, bytes) = result.context("下载工作任务异常")??;
         stop.check()?;
-        let tile =
-            decode(Cursor::new(bytes), TILE).with_context(|| format!("分片 ({x},{y}) 校验失败"))?;
-        assembly.insert(x, y, tile, stop)?;
+        let tile = decode(Cursor::new(bytes), TILE)
+            .context(SourceDataError("源站分片图像无效"))
+            .with_context(|| format!("分片 ({x},{y}) 校验失败"))?;
+        assembly
+            .insert(x, y, tile, stop)
+            .context(SourceDataError("源站分片尺寸或色彩不一致"))?;
         completed += 1;
         notify(Notice::Tiles {
             done: completed,

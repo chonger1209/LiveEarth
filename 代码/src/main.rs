@@ -299,7 +299,7 @@ impl eframe::App for App {
                 self.service.handle.send(Command::Shutdown);
             }
         }
-        if s.exited {
+        if s.exited && (s.exiting || self.closing) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {

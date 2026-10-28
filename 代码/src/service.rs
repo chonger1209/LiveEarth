@@ -3,7 +3,7 @@ use crate::{
     domain::{Observation, Stop},
     engine::{self, Notice, Phase, Report, Selection},
     imaging, journal,
-    net::{HttpFailure, Source},
+    net::{HttpFailure, Source, SourceDataError},
     settings::{self, Preferences},
     storage,
 };
@@ -19,6 +19,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+mod scheduler;
+use scheduler::Scheduler;
 
 #[derive(Clone)]
 pub struct Preview {
@@ -80,12 +83,17 @@ impl Default for Snapshot {
     }
 }
 impl Snapshot {
+    pub fn accepts_commands(&self) -> bool {
+        !self.exiting && !self.exited
+    }
     pub fn can_configure_capture(&self) -> bool {
-        capture_editable(self.enabled, self.busy, self.exiting)
+        self.accepts_commands() && !self.enabled && !self.busy
     }
     pub fn activity_text(&self) -> &str {
         if self.exiting {
             "正在退出"
+        } else if self.exited {
+            "后台已停止，请重启程序"
         } else {
             match self.activity() {
                 Activity::Working => &self.status,
@@ -192,6 +200,30 @@ struct Shared {
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 impl Shared {
+    fn failed(&self, message: String) {
+        let first_failure = {
+            let mut s = self.value.lock().unwrap_or_else(|p| p.into_inner());
+            let first = !s.exited;
+            s.enabled = false;
+            s.busy = false;
+            s.exited = true;
+            s.retrying = false;
+            s.next_check = None;
+            s.error = true;
+            s.status = message.clone();
+            s.feedback = Some(Feedback {
+                message: message.clone(),
+                error: true,
+                at: Instant::now(),
+            });
+            first
+        };
+        if first_failure {
+            self.record(message, true);
+        } else {
+            (self.wake)();
+        }
+    }
     fn set_log_directory(&self, directory: &std::path::Path) {
         let mut log = self.journal.lock().unwrap_or_else(|p| p.into_inner());
         if log.directory() != directory {
@@ -338,7 +370,19 @@ impl Handle {
         rx
     }
     pub fn send(&self, command: Command) {
-        let _ = self.tx.send(command);
+        if let Err(error) = self.tx.send(command) {
+            if matches!(error.0, Command::Shutdown) {
+                self.shared.edit(|s| {
+                    s.enabled = false;
+                    s.busy = false;
+                    s.exiting = true;
+                    s.exited = true;
+                });
+            } else {
+                self.shared
+                    .failed("后台已停止，操作未执行；请退出后重启程序".into());
+            }
+        }
     }
     pub fn snapshot(&self) -> Snapshot {
         self.shared
@@ -370,8 +414,12 @@ impl Service {
     }
     pub fn shutdown(&mut self) {
         self.handle.send(Command::Shutdown);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        if let Some(join) = self.join.take()
+            && join.join().is_err()
+        {
+            self.handle
+                .shared
+                .failed("后台调度异常结束，请重新启动程序".into());
         }
     }
 }
@@ -450,7 +498,8 @@ pub(crate) enum Fault {
     Permanent,
 }
 pub(crate) fn classify(error: &anyhow::Error) -> Fault {
-    if error.downcast_ref::<reqwest::Error>().is_some()
+    if error.downcast_ref::<SourceDataError>().is_some()
+        || error.downcast_ref::<reqwest::Error>().is_some()
         || error
             .downcast_ref::<HttpFailure>()
             .is_some_and(|e| (300..400).contains(&e.0) || e.0 == 429 || e.0 >= 500)
@@ -509,7 +558,7 @@ fn persist_settings(
 impl Service {
     fn spawn_with(
         data: PathBuf,
-        mut prefs: Preferences,
+        prefs: Preferences,
         load: Option<PathBuf>,
         wake: Arc<dyn Fn() + Send + Sync>,
         runner: Runner,
@@ -532,363 +581,10 @@ impl Service {
             shared: shared.clone(),
         };
         let join = thread::spawn(move || {
-            shared.record(
-                format!(
-                    "程序启动 · {} {}",
-                    crate::APP_NAME,
-                    crate::display_version()
-                ),
-                false,
-            );
-            let gate = Arc::new(Mutex::new(Gate {
-                enabled: prefs.automatic,
-                apply: prefs.apply_automatic,
-                zoom: prefs.zoom,
-                ..Default::default()
-            }));
-            let mut enabled = prefs.automatic;
-            let mut exiting = false;
-            let mut due = enabled.then(Instant::now);
-            let mut failures = 0u32;
-            let mut queued = load.map(|path| Job::preload(prefs.clone(), data.clone(), path));
-            let (done_tx, done_rx) = mpsc::channel::<(Result<Outcome>, bool)>();
-            let mut active: Option<(Stop, JoinHandle<()>)> = None;
-            let mut active_automatic = false;
-            let mut followup: Option<Command> = None;
-            let save = |p: &Preferences| {
-                if let Err(e) = settings::save(&data, p) {
-                    shared.feedback(format!("设置保存失败：{e:#}"), true);
-                    false
-                } else {
-                    true
-                }
-            };
-            loop {
-                while let Ok((result, automatic)) = done_rx.try_recv() {
-                    let cancelled = active.as_ref().is_some_and(|a| a.0.is_cancelled());
-                    if let Some((_, join)) = active.take() {
-                        let _ = join.join();
-                    }
-                    let mut batch = shared
-                        .accounting
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .batch
-                        .clone();
-                    shared.edit(|s| {
-                        s.busy = false;
-                        if automatic {
-                            s.last_check = Some(Utc::now());
-                        }
-                    });
-                    let interval = timing
-                        .interval_override
-                        .unwrap_or(Duration::from_secs(prefs.interval_minutes as u64 * 60));
-                    if cancelled {
-                        shared.log(batch.summary("已取消，已完成照片保留"), false);
-                        if automatic {
-                            failures = 0;
-                        }
-                        if automatic && enabled && due.is_none() {
-                            due = Some(Instant::now() + interval);
-                        }
-                    } else {
-                        match result {
-                            Ok(outcome) => {
-                                if let Some(preview) = outcome.preview {
-                                    prefs.last = Some(preview.path.clone());
-                                    save(&prefs);
-                                    shared.edit(|s| s.preview = Some(preview));
-                                }
-                                if let Some(report) = outcome.report {
-                                    shared.edit(|s| {
-                                        if report.saved + report.existed > 0 {
-                                            s.last_success = Some(Utc::now());
-                                        }
-                                    });
-                                    let quiet = automatic
-                                        && report.saved == 0
-                                        && report.missing == 0
-                                        && !batch.wallpaper_updated
-                                        && outcome.warning.is_none();
-                                    batch.report = report.clone();
-                                    if !quiet {
-                                        let result =
-                                            outcome.warning.as_deref().unwrap_or("抓取完成");
-                                        shared.record(
-                                            batch.summary(result),
-                                            report.missing > 0 || outcome.warning.is_some(),
-                                        );
-                                    }
-                                    shared.edit(|s| {
-                                        s.status = if report.missing > 0 {
-                                            "本次抓取完成，存在缺失帧"
-                                        } else {
-                                            "本次抓取完成"
-                                        }
-                                        .into();
-                                        s.error = report.missing > 0;
-                                    });
-                                } else {
-                                    shared.edit(|s| s.status = "原图校验通过".into());
-                                }
-                                if let Some(warning) = outcome.warning {
-                                    shared.edit(|s| {
-                                        s.status = warning;
-                                        s.error = true;
-                                    });
-                                }
-                                if automatic {
-                                    failures = 0;
-                                    if enabled {
-                                        due = Some(Instant::now() + interval);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                let fault = classify(&error);
-                                let mut message = format!("任务失败：{error:#}");
-                                if automatic && enabled && fault == Fault::Transient {
-                                    failures = failures.saturating_add(1);
-                                    let delay = (timing.retry
-                                        * 2u32.pow(failures.saturating_sub(1).min(5)))
-                                    .min(Duration::from_secs(300));
-                                    let delay = error
-                                        .downcast_ref::<crate::net::RetryDelay>()
-                                        .map_or(delay, |v| delay.max(Duration::from_secs(v.0)));
-                                    due = Some(Instant::now() + delay);
-                                    message
-                                        .push_str(&format!("；{} 秒后自动重试", delay.as_secs()));
-                                } else if automatic {
-                                    enabled = false;
-                                    prefs.automatic = false;
-                                    due = None;
-                                    gate.lock().unwrap_or_else(|p| p.into_inner()).enabled = false;
-                                    save(&prefs);
-                                    message.push_str("；定时已停止，处理后点击开始抓取");
-                                }
-                                shared.log(batch.summary(&message), true);
-                            }
-                        }
-                    }
-                }
-                if exiting && active.is_none() {
-                    break;
-                }
-                let wait = due.map_or(timing.poll, |t| {
-                    t.saturating_duration_since(Instant::now()).min(timing.poll)
-                });
-                // Avoid a busy loop while a manual/history job owns the single worker.
-                let wait = if active.is_some() { timing.poll } else { wait };
-                let incoming = followup
-                    .take()
-                    .map(Ok)
-                    .unwrap_or_else(|| rx.recv_timeout(wait));
-                match incoming {
-                    Ok(command) => match match command {
-                        Command::Toggle => Command::SetEnabled(!enabled),
-                        other => other,
-                    } {
-                        Command::Configure(p, then, reply) => {
-                            let editable = capture_editable(
-                                enabled,
-                                active.is_some() || queued.is_some(),
-                                exiting,
-                            );
-                            let result = if exiting {
-                                Err(anyhow::anyhow!("程序正在退出，未接受修改"))
-                            } else {
-                                accept_settings(&data, &prefs, p, editable)
-                            };
-                            let error = match result {
-                                Ok(next) => {
-                                    let wallpaper_changed = next.zoom != prefs.zoom
-                                        || next.apply_automatic != prefs.apply_automatic;
-                                    prefs = next;
-                                    shared.set_log_directory(&prefs.photos);
-                                    if wallpaper_changed {
-                                        let mut g = gate.lock().unwrap_or_else(|p| p.into_inner());
-                                        g.apply = prefs.apply_automatic;
-                                        g.zoom = prefs.zoom;
-                                        g.revision += 1;
-                                    }
-                                    followup = then.map(|action| match action {
-                                        AfterSave::Start => Command::SetEnabled(true),
-                                        AfterSave::Capture(selection, refresh) => {
-                                            Command::Capture(selection, refresh)
-                                        }
-                                    });
-                                    shared.feedback("设置已保存", false);
-                                    None
-                                }
-                                Err(e) => {
-                                    let error = format!("设置未保存：{e:#}");
-                                    shared.feedback(&error, true);
-                                    Some(error)
-                                }
-                            };
-                            shared.edit(|s| s.preferences = Some(prefs.clone()));
-                            let _ = reply.send(ConfigReply {
-                                preferences: prefs.clone(),
-                                error,
-                            });
-                        }
-                        Command::SetEnabled(value) => {
-                            enabled = value;
-                            prefs.automatic = value;
-                            failures = 0;
-                            due = value.then(Instant::now);
-                            {
-                                let mut g = gate.lock().unwrap_or_else(|p| p.into_inner());
-                                g.enabled = value;
-                                g.revision += 1;
-                            }
-                            save(&prefs);
-                            shared.log(
-                                if value {
-                                    "定时抓取已开始"
-                                } else {
-                                    "定时抓取已停止；当前任务可单独取消"
-                                },
-                                false,
-                            );
-                        }
-                        Command::Toggle => unreachable!("toggle is normalized above"),
-                        Command::Capture(selection, refresh) => {
-                            if capture_editable(
-                                enabled,
-                                active.is_some() || queued.is_some(),
-                                exiting,
-                            ) {
-                                queued = Some(Job::manual(
-                                    prefs.clone(),
-                                    data.clone(),
-                                    selection,
-                                    refresh,
-                                ));
-                            } else {
-                                shared.log("已有任务执行中，请等待或取消当前任务", false);
-                            }
-                        }
-                        Command::CheckNow => {
-                            if enabled {
-                                due = Some(Instant::now());
-                            } else if active.is_none() {
-                                queued = Some(Job::manual(
-                                    prefs.clone(),
-                                    data.clone(),
-                                    Selection::Latest(prefs.grid),
-                                    false,
-                                ));
-                            }
-                        }
-                        Command::Cancel => {
-                            if let Some((s, _)) = &active {
-                                s.cancel();
-                                shared.edit(|s| s.status = "正在取消，等待安全退出…".into());
-                            }
-                        }
-                        Command::Resume => {
-                            // Wake only once; do not enqueue missed observations.
-                            if enabled {
-                                due = Some(Instant::now());
-                            }
-                            if active_automatic && let Some((s, _)) = &active {
-                                s.cancel();
-                            }
-                            shared.log("系统已唤醒，等待网络恢复后检查最新影像", false);
-                        }
-                        Command::Record(message, error) => shared.feedback(message, error),
-                        Command::Shutdown => {
-                            shared.record("正在退出程序", false);
-                            save(&prefs);
-                            exiting = true;
-                            enabled = false;
-                            due = None;
-                            queued = None;
-                            gate.lock().unwrap_or_else(|p| p.into_inner()).enabled = false;
-                            if let Some((s, _)) = &active {
-                                s.cancel();
-                            }
-                            shared.edit(|s| s.exiting = true);
-                        }
-                    },
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        exiting = true;
-                        enabled = false;
-                        queued = None;
-                        if let Some((s, _)) = &active {
-                            s.cancel();
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
-                if !exiting && active.is_none() {
-                    if queued.is_none() && enabled && due.is_some_and(|t| Instant::now() >= t) {
-                        queued = Some(Job::automatic(prefs.clone(), data.clone()));
-                        due = None;
-                    }
-                    if let Some(job) = queued.take() {
-                        let automatic = job.automatic;
-                        let stop = Stop::default();
-                        let ws = stop.clone();
-                        active_automatic = automatic;
-                        let runner = runner.clone();
-                        let gate = gate.clone();
-                        let shared = shared.clone();
-                        let done = done_tx.clone();
-                        shared
-                            .accounting
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .batch = Batch::default();
-                        shared.edit(|s| {
-                            s.busy = true;
-                            s.error = false;
-                            s.phase = if job.load.is_some() {
-                                Phase::Reading
-                            } else {
-                                Phase::Checking
-                            };
-                            s.status = s.phase.label().into();
-                        });
-                        let join = thread::spawn(move || {
-                            let result =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    runner(job, &ws, &gate, &|n| shared.notice(n))
-                                }));
-                            let result = match result {
-                                Ok(v) => v,
-                                Err(_) => Err(anyhow::anyhow!("后台任务异常退出；旧照片保留")),
-                            };
-                            let _ = done.send((result, automatic));
-                            (shared.wake)();
-                        });
-                        active = Some((stop, join));
-                    }
-                }
-                {
-                    let mut s = shared.value.lock().unwrap_or_else(|p| p.into_inner());
-                    s.enabled = enabled;
-                    s.retrying = enabled && failures > 0;
-                    s.preferences = Some(prefs.clone());
-                    s.next_check = due.map(|d| {
-                        Utc::now()
-                            + chrono::Duration::from_std(
-                                d.saturating_duration_since(Instant::now()),
-                            )
-                            .unwrap_or_default()
-                    });
-                }
-            }
-            shared.record("程序已退出", false);
-            shared.edit(|s| {
-                s.enabled = false;
-                s.busy = false;
-                s.exiting = true;
-                s.exited = true;
-                s.next_check = None;
-            });
+            let mut scheduler = Scheduler::new(data, prefs, load, shared, rx, runner, timing);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scheduler.run()))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("后台调度发生异常")));
+            scheduler.finish(result);
         });
         Self {
             handle,
@@ -896,6 +592,7 @@ impl Service {
         }
     }
 }
+
 fn real_job(
     job: Job,
     stop: &Stop,

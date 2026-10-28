@@ -572,13 +572,33 @@ async fn server(handler: impl Fn(&str) -> Reply + Send + Sync + 'static) -> Serv
         let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                accepted=listener.accept()=>{let Ok((mut socket,_))=accepted else{break};let handler=handler.clone();let recorded=recorded.clone();connections.spawn(async move{
-                    let mut bytes=Vec::new();let mut buffer=[0u8;1024];
-                    while bytes.len()<8192{let Ok(n)=socket.read(&mut buffer).await else{return};if n==0{return}bytes.extend_from_slice(&buffer[..n]);if bytes.windows(4).any(|x|x==b"\r\n\r\n"){break;}}
-                    let request=String::from_utf8_lossy(&bytes);let path=request.split_whitespace().nth(1).unwrap_or("/");recorded.lock().unwrap().push(path.to_string());let reply=handler(path);tokio::time::sleep(reply.delay).await;
-                    let header=format!("HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",reply.status,reply.bytes.len(),reply.headers);let _=socket.write_all(header.as_bytes()).await;let _=socket.write_all(&reply.bytes).await;
-                });}
-                Some(_)=connections.join_next()=>{}
+                accepted = listener.accept() => {
+                    let Ok((mut socket, _)) = accepted else { break };
+                    let handler = handler.clone();
+                    let recorded = recorded.clone();
+                    connections.spawn(async move {
+                        let mut bytes = Vec::new();
+                        let mut buffer = [0u8; 1024];
+                        while bytes.len() < 8192 {
+                            let Ok(n) = socket.read(&mut buffer).await else { return };
+                            if n == 0 { return; }
+                            bytes.extend_from_slice(&buffer[..n]);
+                            if bytes.windows(4).any(|x| x == b"\r\n\r\n") { break; }
+                        }
+                        let request = String::from_utf8_lossy(&bytes);
+                        let path = request.split_whitespace().nth(1).unwrap_or("/");
+                        recorded.lock().unwrap().push(path.to_string());
+                        let reply = handler(path);
+                        tokio::time::sleep(reply.delay).await;
+                        let header = format!(
+                            "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+                            reply.status, reply.bytes.len(), reply.headers,
+                        );
+                        let _ = socket.write_all(header.as_bytes()).await;
+                        let _ = socket.write_all(&reply.bytes).await;
+                    });
+                }
+                Some(_) = connections.join_next() => {}
             }
         }
     });
@@ -954,4 +974,105 @@ async fn redirects_follow_same_origin_and_reject_cross_origin_or_loops() {
         crate::service::classify(&error),
         crate::service::Fault::Transient
     );
+}
+
+#[test]
+fn webp_metadata_is_bounded_before_reading_oversized_chunks() {
+    use std::{
+        cell::Cell,
+        io::{self, BufRead, Read, Seek, SeekFrom},
+        rc::Rc,
+    };
+    struct ObservedRead {
+        cursor: Cursor<Vec<u8>>,
+        largest: Rc<Cell<usize>>,
+    }
+    impl Read for ObservedRead {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.largest.set(self.largest.get().max(buffer.len()));
+            Read::read(&mut self.cursor, buffer)
+        }
+    }
+    impl BufRead for ObservedRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.cursor.fill_buf()
+        }
+        fn consume(&mut self, count: usize) {
+            self.cursor.consume(count);
+        }
+    }
+    impl Seek for ObservedRead {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.cursor.seek(pos)
+        }
+    }
+    let mut bytes = b"RIFF\0\0\0\0WEBPVP8X".to_vec();
+    bytes.extend_from_slice(&10u32.to_le_bytes());
+    bytes.extend_from_slice(&[4, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(b"VP8L");
+    bytes.extend_from_slice(&5u32.to_le_bytes());
+    bytes.extend_from_slice(&[0x2f, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(b"XMP ");
+    bytes.extend_from_slice(&(4u32 * 1024 * 1024).to_le_bytes());
+    let size = (bytes.len() - 8) as u32;
+    bytes[4..8].copy_from_slice(&size.to_le_bytes());
+    let largest = Rc::new(Cell::new(0));
+    let reader = ObservedRead {
+        cursor: Cursor::new(bytes.clone()),
+        largest: largest.clone(),
+    };
+    let error = crate::webp_archive::read_note(reader).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<image_webp::DecodingError>(),
+        Some(image_webp::DecodingError::MemoryLimitExceeded)
+    ));
+    assert!(
+        largest.get() <= 131072,
+        "must reject before requesting a large read buffer"
+    );
+    let error = crate::webp_archive::decode(&bytes, &Stop::default())
+        .err()
+        .unwrap();
+    assert!(matches!(
+        error.downcast_ref::<image_webp::DecodingError>(),
+        Some(image_webp::DecodingError::MemoryLimitExceeded)
+    ));
+}
+
+#[tokio::test]
+async fn invalid_source_payloads_are_retryable_and_never_saved() {
+    use crate::service::{Fault, classify};
+    use chrono::Timelike;
+    let future = (Utc::now() + chrono::Duration::hours(1))
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
+    let future_json =
+        format!(r#"{{"date":"{}"}}"#, future.format("%Y-%m-%d %H:%M:%S")).into_bytes();
+    for body in [b"temporary invalid metadata".to_vec(), future_json] {
+        let server = server(move |_| Reply::ok(body.clone())).await;
+        let error = Source::local(&server.origin)
+            .unwrap()
+            .latest(1, &Stop::default())
+            .await
+            .unwrap_err();
+        assert_eq!(classify(&error), Fault::Transient);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(|_| Reply::ok(b"temporary invalid PNG".to_vec())).await;
+    let error = engine::run(
+        Source::local(&server.origin).unwrap(),
+        Selection::History(vec![observation(1)]),
+        dir.path(),
+        false,
+        &Stop::default(),
+        &|_| {},
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(classify(&error), Fault::Transient);
+    assert_eq!(archive_count(dir.path()), 0);
 }
