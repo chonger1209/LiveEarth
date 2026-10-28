@@ -28,7 +28,7 @@
 
 ## Rust 依赖与内嵌回退字体
 
-版本以 `代码/Cargo.lock` 为准。[Rust 依赖许可汇总](许可证/Rust依赖许可.txt)保存 Windows GNU 目标解析到的 201 项依赖的许可声明及可取得的许可全文（含构建依赖）。缓存包缺少许可正文时从其 `.cargo_vcs_info.json` 对应的上游提交取得，未用当前主分支内容冒充发布版本。
+版本以 `代码/Cargo.lock` 为准。[Rust 依赖许可汇总](许可证/Rust依赖许可.txt)保存 Windows GNU 目标解析到的 206 项依赖的许可声明及可取得的许可全文（含构建依赖）。缓存包缺少许可正文时从其 `.cargo_vcs_info.json` 对应的上游提交取得，未用当前主分支内容冒充发布版本。
 
 egui 自带的 Hack、Noto Emoji、Ubuntu 和 emoji-icon-font 字体具有独立条款，相关正文包含在上述汇总的 epaint_default_fonts 段落。依赖许可不被项目 MIT 替代。
 

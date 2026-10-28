@@ -148,7 +148,7 @@ def check_resources(exe):
         k.FreeLibrary(module)
 
 
-def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, startup=True, download=False, controls=False, directory_only=False):
+def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, startup=True, download=False, controls=False, directory_only=False, measure_cpu=False):
     directory.mkdir(parents=True, exist_ok=True)
     settings = {"schema": 4, "grid": 1, "zoom": 100, "interval_minutes": 1,
                 "automatic": download, "apply_automatic": False, "beijing": True,
@@ -187,6 +187,25 @@ def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, s
             assert process.poll() is None, f"process exited {process.returncode}"
             assert time.monotonic() < end, "native acceptance timeout"
             time.sleep(0.05)
+    measurements = []
+    def sample_cpu(state, seconds=6):
+        if not measure_cpu:
+            return
+        kernel = c.WinDLL("kernel32", use_last_error=True)
+        kernel.GetProcessTimes.argtypes = [w.HANDLE] + [c.POINTER(w.FILETIME)] * 4
+        kernel.GetProcessTimes.restype = w.BOOL
+        def cpu_seconds():
+            times = [w.FILETIME() for _ in range(4)]
+            assert kernel.GetProcessTimes(int(process._handle), *(c.byref(t) for t in times))
+            return sum((t.dwHighDateTime << 32) | t.dwLowDateTime for t in times[2:]) / 10_000_000
+        before, started = cpu_seconds(), time.monotonic()
+        time.sleep(seconds)
+        elapsed = time.monotonic() - started
+        percent = (cpu_seconds() - before) * 100 / elapsed
+        measurements.append({"state": state, "seconds": round(elapsed, 3), "one_core_percent": round(percent, 3)})
+        (directory / "cpu.json").write_text(json.dumps(measurements, indent=2), encoding="utf-8")
+        print(f"CPU {state}: {percent:.3f}% of one logical processor", flush=True)
+        assert percent < 10, f"idle window busy-looped in {state}: {percent:.1f}% of one core"
     tray = None
     try:
         wait(lambda: "LiveEarth background" in windows() and "LiveEarth" in windows())
@@ -201,6 +220,7 @@ def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, s
         else:
             wait(lambda: user.IsWindowVisible(main) and not user.IsIconic(main))
         print(f"Startup={startup}, minimize={start_minimized}, tray={minimize_to_tray}: PASS", flush=True)
+        sample_cpu("startup_hidden" if hidden else "startup_visible")
         if download:
             wait(lambda: json.loads((directory / "settings.json").read_text(encoding="utf-8")).get("last") is not None, 60)
             assert any((directory / "photos").glob("*.webp"))
@@ -213,6 +233,7 @@ def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, s
         # simulating the next, independent user action.
         time.sleep(0.8)
         print("Tray left-click restores window: PASS", flush=True)
+        sample_cpu("visible")
         if controls:
             user.SetThreadDpiAwarenessContext.argtypes = [c.c_void_p]
             user.SetThreadDpiAwarenessContext.restype = c.c_void_p
@@ -343,6 +364,7 @@ def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, s
         else:
             wait(lambda: user.IsWindowVisible(main) and user.IsIconic(main))
         print("Minimize respects saved tray preference: PASS", flush=True)
+        sample_cpu("minimized_to_tray" if minimize_to_tray else "minimized_to_taskbar")
         user.PostMessageW(tray, 0x800A, 0, 0x0202)
         wait(lambda: user.IsWindowVisible(main) and not user.IsIconic(main))
         time.sleep(0.8)
@@ -350,16 +372,25 @@ def check_tray(exe, directory, *, minimize_to_tray=True, start_minimized=True, s
         wait(lambda: not user.IsWindowVisible(main))
         assert process.poll() is None
         print("Close to tray retains process: PASS", flush=True)
+        sample_cpu("closed_to_tray", seconds=8)
         photo_directory = Path(json.loads((directory / "settings.json").read_text(encoding="utf-8"))["photos"])
         logs = list(photo_directory.glob("运行记录-*.log"))
         assert len(logs) == 1
         assert ("设置已保存" if controls else "程序启动") in logs[0].read_text(encoding="utf-8")
-        logs[0].unlink()
-        # An explicit power notification is delivered only to this application's window.
-        assert user.SendMessageW(tray, 0x0218, 18, 0) == 1
-        wait(lambda: logs[0].exists() and "系统已唤醒" in logs[0].read_text(encoding="utf-8"))
-        print("Daily log deleted while running and recreated: PASS", flush=True)
-        print("Synthetic resume notification accepted: PASS", flush=True)
+        if not measure_cpu:
+            logs[0].unlink()
+            # An explicit power notification is delivered only to this application's window.
+            assert user.SendMessageW(tray, 0x0218, 18, 0) == 1
+            wait(lambda: logs[0].exists() and "系统已唤醒" in logs[0].read_text(encoding="utf-8"))
+            print("Daily log deleted while running and recreated: PASS", flush=True)
+            print("Synthetic resume notification accepted: PASS", flush=True)
+        else:
+            user.PostMessageW(tray, 0x800A, 0, 0x0202)
+            wait(lambda: user.IsWindowVisible(main) and not user.IsIconic(main))
+            time.sleep(0.8)
+            sample_cpu("restored_after_close")
+            user.PostMessageW(main, 0x0010, 0, 0)
+            wait(lambda: not user.IsWindowVisible(main))
     finally:
         if tray and process.poll() is None:
             user.PostMessageW(tray, 0x0011, 0, 0)
@@ -404,6 +435,7 @@ if __name__ == "__main__":
     parser.add_argument("--screens", type=Path)
     parser.add_argument("--directories", action="store_true", help="Run only directory interaction checks")
     parser.add_argument("--controls", action="store_true", help="Check auto-save, capture locks and directories with real input")
+    parser.add_argument("--tray-performance", action="store_true", help="Check hidden/visible CPU and tray lifecycle without screenshots or network downloads")
     args = parser.parse_args()
     if bool(args.png) != bool(args.webp):
         parser.error("--png and --webp must be supplied together")
@@ -411,8 +443,11 @@ if __name__ == "__main__":
         parser.error("--screens requires --png as the preview source")
     if args.png:
         check_archive(args.png, args.webp)
-    check_resources(args.exe)
-    if args.directories:
+    if not args.tray_performance:
+        check_resources(args.exe)
+    if args.tray_performance:
+        check_tray(args.exe, args.data / "tray-performance", measure_cpu=True)
+    elif args.directories:
         check_tray(args.exe, args.data / "directories", minimize_to_tray=False, startup=False, controls=True, directory_only=True)
     elif args.controls:
         check_tray(args.exe, args.data / "controls", minimize_to_tray=False, startup=False, controls=True)

@@ -253,7 +253,7 @@ mod tests {
         );
         for theme in [egui::Theme::Dark, egui::Theme::Light] {
             ctx.set_theme(theme);
-            let style = ctx.style();
+            let style = ctx.global_style();
             let colors = ThemeColors::for_theme(theme == egui::Theme::Dark);
             assert_eq!(style.visuals.dark_mode, colors.dark);
             assert_eq!(style.visuals.panel_fill, colors.panel);
@@ -279,13 +279,13 @@ mod tests {
 
     fn pixels(state: Activity, time: f64) -> Vec<egui::epaint::RectShape> {
         let ctx = egui::Context::default();
-        let output = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 time: Some(time),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| activity(ui, state));
+            |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| activity(ui, state));
             },
         );
         output

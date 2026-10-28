@@ -249,7 +249,6 @@ mod native {
         ctx: eframe::egui::Context,
         taskbar: u32,
         tip: Mutex<String>,
-        exit_shown: std::sync::atomic::AtomicBool,
     }
     thread_local! {static STATE:RefCell<Option<Arc<State>>>=const{RefCell::new(None)};}
     fn notify(hwnd: HWND, state: &State, op: NOTIFY_ICON_MESSAGE, tip: &str) -> bool {
@@ -268,16 +267,12 @@ mod native {
     }
     fn show(state: &State) {
         use eframe::egui::ViewportCommand;
-        state.ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         state
             .ctx
             .send_viewport_cmd(ViewportCommand::Minimized(false));
+        state.ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         state.ctx.send_viewport_cmd(ViewportCommand::Focus);
         state.ctx.request_repaint();
-        unsafe {
-            let _ = ShowWindowAsync(HWND(state.main as *mut _), SW_RESTORE);
-            let _ = SetForegroundWindow(HWND(state.main as *mut _));
-        }
     }
     fn menu(hwnd: HWND, state: &State) {
         unsafe {
@@ -371,34 +366,18 @@ mod native {
                     }
                     drop(previous);
                     let main = HWND(state.main as *mut _);
-                    // Hidden/occluded windows may not receive another egui frame.
-                    // Reveal the closing window once so winit can finish its normal teardown.
-                    if snap.exiting
-                        && !state
-                            .exit_shown
-                            .swap(true, std::sync::atomic::Ordering::SeqCst)
-                    {
-                        show(&state);
-                    }
-                    if snap.exited {
-                        state
-                            .ctx
-                            .send_viewport_cmd(eframe::egui::ViewportCommand::Close);
-                        unsafe {
-                            let _ = PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0));
-                        }
-                    } else if snap
-                        .preferences
-                        .as_ref()
-                        .is_some_and(|p| p.minimize_to_tray)
-                        && unsafe { IsIconic(main).as_bool() }
+                    // eframe now processes commands while hidden. Keep visibility in
+                    // one queue, and do not repeatedly hide an already hidden window.
+                    if !snap.exiting
+                        && snap
+                            .preferences
+                            .as_ref()
+                            .is_some_and(|p| p.minimize_to_tray)
+                        && unsafe { IsWindowVisible(main).as_bool() && IsIconic(main).as_bool() }
                     {
                         state
                             .ctx
                             .send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
-                        unsafe {
-                            let _ = ShowWindowAsync(main, SW_HIDE);
-                        }
                     }
                     return LRESULT(0);
                 }
@@ -467,7 +446,6 @@ mod native {
                         ctx,
                         taskbar: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
                         tip: Mutex::new(String::new()),
-                        exit_shown: std::sync::atomic::AtomicBool::new(false),
                     });
                     STATE.with(|v| *v.borrow_mut() = Some(state.clone()));
                     let hwnd = unsafe {

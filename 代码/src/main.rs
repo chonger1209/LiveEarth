@@ -277,23 +277,12 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // eframe calls logic for background events even when the window is hidden.
         self.receive_settings();
         self.receive_directory();
         let s = self.service.handle.snapshot();
         self.prefs.automatic = s.enabled;
-        if let Some(p) = &s.preview
-            && !self.preview.as_ref().is_some_and(|old| Arc::ptr_eq(old, p))
-        {
-            let color = egui::ColorImage::from_rgb(
-                [p.pixels.width() as usize, p.pixels.height() as usize],
-                p.pixels.as_raw(),
-            );
-            self.texture = Some(ctx.load_texture("earth", color, egui::TextureOptions::LINEAR));
-            self.preview = Some(p.clone());
-            self.prefs.last = Some(p.path.clone());
-            self.screen = desktop::primary_size().unwrap_or(self.screen);
-        }
         if ctx.input(|i| i.viewport().close_requested()) && !s.exited {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.prefs.close_to_tray
@@ -313,88 +302,7 @@ impl eframe::App for App {
         if s.exited {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(APP_NAME);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.small(display_version());
-                    if let Some(f) = &s.feedback
-                        && f.at.elapsed() < Duration::from_secs(if f.error { 6 } else { 3 })
-                    {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&f.message).color(if f.error {
-                                widgets::colors(ui).error
-                            } else {
-                                widgets::colors(ui).success
-                            }))
-                            .truncate(),
-                        )
-                        .on_hover_text(&f.message);
-                    }
-                });
-            });
-        });
-        let controls_height = self.mode.controls_height();
-        let max_log =
-            (ctx.available_rect().height() - controls_height).max(widgets::LOG_MIN_HEIGHT);
-        egui::TopBottomPanel::bottom("status")
-            .resizable(true)
-            .default_height(240.)
-            .min_height(widgets::LOG_MIN_HEIGHT)
-            .max_height(max_log)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "本次运行｜已保存 {} 张｜源站缺失 {} 张",
-                        s.saved, s.missing
-                    ));
-                    if let Some(e) = &s.log_error {
-                        ui.colored_label(widgets::colors(ui).error, "日志未落盘")
-                            .on_hover_text(e);
-                    }
-                });
-                ui.strong("运行记录");
-                egui::ScrollArea::vertical()
-                    .id_salt("run-log")
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &s.logs {
-                            ui.add(egui::Label::new(egui::RichText::new(line).size(13.)).wrap());
-                        }
-                    });
-            });
-        egui::SidePanel::left("controls")
-            .exact_width(widgets::CONTROLS_WIDTH)
-            .resizable(false)
-            .show(ctx, |ui| self.controls(ui, &s));
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let (Some(p), Some(texture)) = (&self.preview, &self.texture) {
-                let o = &p.observation;
-                let metadata = format!(
-                    "完整原图 ｜ {} UTC ｜ {} ｜ {}×{} ｜ {} {:.2} MiB",
-                    o.time.format("%Y-%m-%d %H:%M"),
-                    o.satellite,
-                    o.side(),
-                    o.side(),
-                    p.format,
-                    p.bytes as f64 / 1048576.
-                );
-                ui.add(egui::Label::new(&metadata).truncate())
-                    .on_hover_text(&metadata);
-                let space = ui.available_size();
-                let side = space.x.min(space.y).max(1.);
-                ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(side, side)));
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("选择“抓取本次”下载一批\n或选择“开始抓取”定时获取最新影像");
-                });
-            }
-        });
-        self.settings_window(ctx);
-        self.about_window(ctx);
-        self.guide_window(ctx);
-        if self.dirty && !ctx.input(|i| i.pointer.any_down()) && !ctx.wants_keyboard_input() {
+        if self.dirty && !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
             self.submit_settings(None);
         }
         if self.first_frame {
@@ -443,6 +351,104 @@ impl eframe::App for App {
                 self.service.handle.send(Command::Shutdown);
             }
         }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let s = self.service.handle.snapshot();
+        // Upload preview textures only when the UI is actually being drawn.
+        if let Some(p) = &s.preview
+            && !self.preview.as_ref().is_some_and(|old| Arc::ptr_eq(old, p))
+        {
+            let color = egui::ColorImage::from_rgb(
+                [p.pixels.width() as usize, p.pixels.height() as usize],
+                p.pixels.as_raw(),
+            );
+            self.texture = Some(ctx.load_texture("earth", color, egui::TextureOptions::LINEAR));
+            self.preview = Some(p.clone());
+            self.prefs.last = Some(p.path.clone());
+            self.screen = desktop::primary_size().unwrap_or(self.screen);
+        }
+        egui::Panel::top("header").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(APP_NAME);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small(display_version());
+                    if let Some(f) = &s.feedback
+                        && f.at.elapsed() < Duration::from_secs(if f.error { 6 } else { 3 })
+                    {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&f.message).color(if f.error {
+                                widgets::colors(ui).error
+                            } else {
+                                widgets::colors(ui).success
+                            }))
+                            .truncate(),
+                        )
+                        .on_hover_text(&f.message);
+                    }
+                });
+            });
+        });
+        let controls_height = self.mode.controls_height();
+        let max_log = (ui.available_height() - controls_height).max(widgets::LOG_MIN_HEIGHT);
+        egui::Panel::bottom("status")
+            .resizable(true)
+            .default_size(240.)
+            .min_size(widgets::LOG_MIN_HEIGHT)
+            .max_size(max_log)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "本次运行｜已保存 {} 张｜源站缺失 {} 张",
+                        s.saved, s.missing
+                    ));
+                    if let Some(e) = &s.log_error {
+                        ui.colored_label(widgets::colors(ui).error, "日志未落盘")
+                            .on_hover_text(e);
+                    }
+                });
+                ui.strong("运行记录");
+                egui::ScrollArea::vertical()
+                    .id_salt("run-log")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &s.logs {
+                            ui.add(egui::Label::new(egui::RichText::new(line).size(13.)).wrap());
+                        }
+                    });
+            });
+        egui::Panel::left("controls")
+            .exact_size(widgets::CONTROLS_WIDTH)
+            .resizable(false)
+            .show_inside(ui, |ui| self.controls(ui, &s));
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            if let (Some(p), Some(texture)) = (&self.preview, &self.texture) {
+                let o = &p.observation;
+                let metadata = format!(
+                    "完整原图 ｜ {} UTC ｜ {} ｜ {}×{} ｜ {} {:.2} MiB",
+                    o.time.format("%Y-%m-%d %H:%M"),
+                    o.satellite,
+                    o.side(),
+                    o.side(),
+                    p.format,
+                    p.bytes as f64 / 1048576.
+                );
+                ui.add(egui::Label::new(&metadata).truncate())
+                    .on_hover_text(&metadata);
+                let space = ui.available_size();
+                let side = space.x.min(space.y).max(1.);
+                ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(side, side)));
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("选择“抓取本次”下载一批\n或选择“开始抓取”定时获取最新影像");
+                });
+            }
+        });
+        self.settings_window(&ctx);
+        self.about_window(&ctx);
+        self.guide_window(&ctx);
         // Hidden/minimized windows receive event-driven wakes, not animation ticks.
         if platform::window_visible(self.main_window) {
             ctx.request_repaint_after(Duration::from_millis(
