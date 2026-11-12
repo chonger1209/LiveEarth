@@ -63,7 +63,8 @@ fn session_totals_survive_cancel_and_error_without_counting_reuse() {
         3,
         "startup plus one line per finished attempt"
     );
-    assert!(snap.logs.back().unwrap().contains("新增 1｜已有 1｜缺失 2"));
+    assert!(snap.logs[1].contains("新增 1｜今日累计 1｜缺失 2"));
+    assert!(snap.logs[2].contains("新增 1｜今日累计 2｜缺失 2"));
     service.shutdown();
     let mut restarted = Service::spawn_with(
         dir.path().into(),

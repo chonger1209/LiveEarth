@@ -164,14 +164,14 @@ impl Default for Batch {
     }
 }
 impl Batch {
-    fn summary(&self, result: &str) -> String {
+    fn summary(&self, result: &str, today: Option<u64>) -> String {
         let time = self.observation.as_ref().map_or(String::new(), |o| {
             format!("｜影像 {} UTC", o.time.format("%m-%d %H:%M"))
         });
+        let today = today.map_or_else(|| "不可用".into(), |total| total.to_string());
         format!(
-            "{result}{time}｜新增 {}｜已有 {}｜缺失 {}{}{}｜耗时 {:.1} 秒",
+            "{result}{time}｜新增 {}｜今日累计 {today}｜缺失 {}{}{}｜耗时 {:.1} 秒",
             self.report.saved,
-            self.report.existed,
             self.report.missing,
             if self.wallpaper_updated {
                 "｜壁纸已更新"
@@ -235,16 +235,26 @@ impl Shared {
         (self.wake)();
     }
     fn record(&self, message: impl Into<String>, error: bool) {
-        let message = message.into();
+        self.record_event(error, None, |_| message.into());
+    }
+    fn record_batch(&self, batch: &Batch, result: &str, error: bool) {
+        self.record_event(error, Some(batch.report.saved), |today| {
+            batch.summary(result, today)
+        });
+    }
+    fn record_event(
+        &self,
+        error: bool,
+        saved: Option<usize>,
+        message: impl FnOnce(Option<u64>) -> String,
+    ) {
         let time = Utc::now();
-        let line = journal::line(time, &message, error);
-        let failure = self
+        let (line, written) = self
             .journal
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .append(time, &line)
-            .err()
-            .map(|e| format!("日志未写入文件：{e}"));
+            .record(time, error, saved, message);
+        let failure = written.err().map(|e| format!("日志文件操作失败：{e}"));
         self.edit(|s| {
             s.logs.push_back(line);
             if failure != s.log_error {
@@ -264,8 +274,11 @@ impl Shared {
     fn log(&self, message: impl Into<String>, error: bool) {
         let message = message.into();
         self.record(&message, error);
+        self.set_status(message, error);
+    }
+    fn set_status(&self, message: impl Into<String>, error: bool) {
         self.edit(|s| {
-            s.status = message;
+            s.status = message.into();
             s.error = error;
         });
     }

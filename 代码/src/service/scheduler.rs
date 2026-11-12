@@ -171,8 +171,9 @@ impl Scheduler {
             }
         });
         if cancelled {
-            self.shared
-                .log(batch.summary("已取消，已完成照片保留"), false);
+            let message = "已取消，已完成照片保留";
+            self.shared.record_batch(&batch, message, false);
+            self.shared.set_status(message, false);
             if automatic {
                 self.failures = 0;
             }
@@ -234,8 +235,9 @@ impl Scheduler {
         let missing = report.missing > 0;
         batch.report = report;
         if !quiet {
-            self.shared.record(
-                batch.summary(warning.unwrap_or("抓取完成")),
+            self.shared.record_batch(
+                batch,
+                warning.unwrap_or("抓取完成"),
                 missing || warning.is_some(),
             );
         }
@@ -273,7 +275,8 @@ impl Scheduler {
             self.save_preferences();
             message.push_str("；定时已停止，处理后点击开始抓取");
         }
-        self.shared.log(batch.summary(&message), true);
+        self.shared.record_batch(batch, &message, true);
+        self.shared.set_status(message, true);
         Ok(())
     }
 

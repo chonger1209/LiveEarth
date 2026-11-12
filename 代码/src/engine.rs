@@ -147,13 +147,7 @@ pub async fn run_as(
             }
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!(
-                        "任务停止；本批已新增 {}、已有 {}、缺失 {}，未完成 {}。已存照片保留",
-                        report.saved,
-                        report.existed,
-                        report.missing,
-                        report.planned - index
-                    )
+                    format!("剩余 {} 张未完成，已存照片保留", report.planned - index)
                 });
             }
         }
